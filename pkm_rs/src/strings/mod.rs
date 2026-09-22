@@ -1,4 +1,5 @@
-// mod gameboy;
+mod gameboy;
+pub use gameboy::GbString;
 
 #[cfg(feature = "wasm")]
 mod gen3;

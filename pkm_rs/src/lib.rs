@@ -1,5 +1,6 @@
 #[cfg(feature = "wasm")]
 mod checksum;
+pub mod conversion;
 #[cfg(feature = "wasm")]
 mod encryption;
 mod rom_hacks;
@@ -9,6 +10,7 @@ mod util;
 pub mod bytes;
 pub mod convert_strategy;
 pub mod format;
+pub mod gen1;
 #[cfg(feature = "wasm")]
 pub mod gen3;
 #[cfg(feature = "wasm")]

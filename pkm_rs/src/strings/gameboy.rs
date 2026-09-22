@@ -11,20 +11,34 @@ use rand::{
     distr::{Alphanumeric, SampleString},
 };
 
-#[derive(Debug)]
+/// Generation I and II end a name with 0x50 and pad the rest of the field
+/// with it; 0x00 is a legitimate character, so it cannot serve as the end.
+const TERMINATOR: u8 = 0x50;
+
+/// What the games store for a character they have no glyph for.
+const UNKNOWN_CHARACTER: u8 = 0xe6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GbString<const N: usize> {
     raw: [u8; N],
 }
 
 impl<const N: usize> From<&str> for GbString<N> {
     fn from(value: &str) -> Self {
-        let mut raw = [0; N];
+        // The games fill a name field with the terminator and overwrite the
+        // front of it, so an unused tail reads back as the end of the string
+        // rather than as padding that has to be trimmed.
+        let mut raw = [TERMINATOR; N];
+
         let encoded: Vec<u8> = value
             .chars()
-            .filter_map(gameboy_string_encoding::encode)
+            .map(|character| {
+                gameboy_string_encoding::encode(character).unwrap_or(UNKNOWN_CHARACTER)
+            })
             .collect();
 
-        let len = encoded.len().min(N);
+        // One byte is always kept back so a full-length name still terminates.
+        let len = encoded.len().min(N.saturating_sub(1));
         raw[..len].copy_from_slice(&encoded[..len]);
 
         GbString { raw }
@@ -43,7 +57,7 @@ impl<const N: usize> Display for GbString<N> {
             .raw
             .iter()
             .copied()
-            .take_while(|c| *c != 0xff)
+            .take_while(|c| *c != TERMINATOR)
             .map(gameboy_string_encoding::decode)
             .map(|o| o.unwrap_or('\u{FFFD}'))
             .collect();
@@ -68,11 +82,11 @@ impl<const N: usize> Serialize for GbString<N> {
 }
 
 impl<const N: usize> GbString<N> {
-    pub fn from_bytes(bytes: [u8; N]) -> Self {
+    pub const fn from_bytes(bytes: [u8; N]) -> Self {
         GbString { raw: bytes }
     }
 
-    pub fn bytes(&self) -> [u8; N] {
+    pub const fn bytes(&self) -> [u8; N] {
         self.raw
     }
 }
