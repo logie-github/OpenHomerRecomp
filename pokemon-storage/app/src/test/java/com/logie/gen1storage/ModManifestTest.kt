@@ -1,0 +1,216 @@
+package com.logie.gen1storage
+
+import com.logie.gen1storage.mods.ModManifest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * What `mod.json` is allowed to say, and how little of it there is to say:
+ * a name, an author, and a palette that is nothing but five colours — no
+ * field here can name a behaviour, only a look.
+ */
+class ModManifestTest {
+
+    private val fullPalette = """
+        {
+          "name": "Twilight",
+          "author": "Someone",
+          "palette": {
+            "id": "twilight",
+            "label": "TWILIGHT",
+            "lightest": "#F0F0FF",
+            "light": "#9090CC",
+            "dark": "#404070",
+            "darkest": "#100818",
+            "surround": "#201030",
+            "tintsSprites": false
+          }
+        }
+    """.trimIndent()
+
+    @Test
+    fun `a full manifest parses every field`() {
+        val manifest = ModManifest.parse(fullPalette, fallbackId = "fallback", fallbackName = "Fallback")
+        assertEquals("Twilight", manifest.name)
+        assertEquals("Someone", manifest.author)
+        val palette = manifest.palette!!
+        assertEquals("twilight", palette.id)
+        assertEquals("TWILIGHT", palette.label)
+        assertEquals(0xFFF0F0FF.toInt(), palette.lightest)
+        assertEquals(0xFF9090CC.toInt(), palette.light)
+        assertEquals(0xFF404070.toInt(), palette.dark)
+        assertEquals(0xFF100818.toInt(), palette.darkest)
+        assertEquals(0xFF201030.toInt(), palette.surround)
+        assertEquals(false, palette.tintsSprites)
+        assertEquals(1f, palette.opacity)
+        assertNull(manifest.fontAsset)
+        assertNull(manifest.borderAsset)
+    }
+
+    @Test
+    fun `a font and border asset are read when named`() {
+        val json = """{"name": "Chrome", "fontAsset": "fonts/custom.ttf", "borderAsset": "art/border.png"}"""
+        val manifest = ModManifest.parse(json, "id", "Chrome")
+        assertEquals("fonts/custom.ttf", manifest.fontAsset)
+        assertEquals("art/border.png", manifest.borderAsset)
+    }
+
+    @Test
+    fun `an asset path that reaches outside the mod is dropped`() {
+        val json = """{"name": "Escape", "fontAsset": "../../etc/passwd", "borderAsset": "/etc/shadow"}"""
+        val manifest = ModManifest.parse(json, "id", "Escape")
+        assertNull(manifest.fontAsset)
+        assertNull(manifest.borderAsset)
+    }
+
+    @Test
+    fun `a background, a ball and chrome colours all parse`() {
+        val json = """
+            {
+              "name": "Neon",
+              "background": {"asset": "bg.png", "fit": "tile"},
+              "ball": {"asset": "ball.png", "spins": false},
+              "chrome": {
+                "ink": "#FFD21E", "panel": "#CC0A0F18", "barFill": "#05070A",
+                "barText": "#2FA8FF", "hpGreen": "#39FF88"
+              }
+            }
+        """.trimIndent()
+        val manifest = ModManifest.parse(json, "id", "Neon")
+        assertEquals("bg.png", manifest.background!!.asset)
+        assertEquals("tile", manifest.background!!.fit)
+        assertEquals("ball.png", manifest.ball!!.asset)
+        assertEquals(false, manifest.ball!!.spins)
+        val chrome = manifest.chrome!!
+        assertEquals(0xFFFFD21E.toInt(), chrome.ink)
+        // Carrying its own alpha, which is the only way a window fill can be
+        // told to let the background through.
+        assertEquals(0xCC0A0F18.toInt(), chrome.panel)
+        assertEquals(0xFF05070A.toInt(), chrome.barFill)
+        assertEquals(0xFF2FA8FF.toInt(), chrome.barText)
+        assertEquals(0xFF39FF88.toInt(), chrome.hpGreen)
+        // Never named, so the app's own is what draws.
+        assertNull(chrome.hpRed)
+    }
+
+    @Test
+    fun `an unknown background fit falls back to cover`() {
+        val json = """{"background": {"asset": "bg.png", "fit": "parallax"}}"""
+        assertEquals("cover", ModManifest.parse(json, "id", "Name").background!!.fit)
+    }
+
+    @Test
+    fun `a background naming no asset at all is dropped`() {
+        val json = """{"background": {"fit": "tile"}, "ball": {"spins": true}}"""
+        val manifest = ModManifest.parse(json, "id", "Name")
+        assertNull(manifest.background)
+        assertNull(manifest.ball)
+    }
+
+    @Test
+    fun `a ball spins unless it says otherwise`() {
+        val json = """{"ball": {"asset": "emblem.png"}}"""
+        assertTrue(ModManifest.parse(json, "id", "Name").ball!!.spins)
+    }
+
+    @Test
+    fun `opacity is clamped to a floor no window ever goes below`() {
+        val json = """
+            {"palette": {
+                "lightest": "#FFFFFF", "light": "#CCCCCC", "dark": "#333333",
+                "darkest": "#000000", "surround": "#111111", "opacity": 0
+            }}
+        """.trimIndent()
+        val palette = ModManifest.parse(json, "id", "Name").palette!!
+        assertEquals(0.35f, palette.opacity)
+    }
+
+    @Test
+    fun `opacity is clamped to never exceed fully solid`() {
+        val json = """
+            {"palette": {
+                "lightest": "#FFFFFF", "light": "#CCCCCC", "dark": "#333333",
+                "darkest": "#000000", "surround": "#111111", "opacity": 4
+            }}
+        """.trimIndent()
+        val palette = ModManifest.parse(json, "id", "Name").palette!!
+        assertEquals(1f, palette.opacity)
+    }
+
+    @Test
+    fun `opacity defaults to fully solid when never named`() {
+        val json = """
+            {"palette": {
+                "lightest": "#FFFFFF", "light": "#CCCCCC", "dark": "#333333",
+                "darkest": "#000000", "surround": "#111111"
+            }}
+        """.trimIndent()
+        val palette = ModManifest.parse(json, "id", "Name").palette!!
+        assertEquals(1f, palette.opacity)
+    }
+
+    @Test
+    fun `a name-only manifest has no palette`() {
+        val manifest = ModManifest.parse("""{"name": "Just A Name"}""", fallbackId = "id", fallbackName = "Fallback")
+        assertEquals("Just A Name", manifest.name)
+        assertNull(manifest.author)
+        assertNull(manifest.palette)
+    }
+
+    @Test
+    fun `an empty manifest falls back to the id and name it was given`() {
+        val manifest = ModManifest.parse("{}", fallbackId = "mod-123", fallbackName = "mod-123")
+        assertEquals("mod-123", manifest.name)
+        assertNull(manifest.author)
+        assertNull(manifest.palette)
+    }
+
+    @Test
+    fun `a palette missing any one colour is dropped rather than half-read`() {
+        val json = """
+            {"name": "Broken", "palette": {"lightest": "#FFFFFF", "light": "#CCCCCC", "dark": "#333333"}}
+        """.trimIndent()
+        val manifest = ModManifest.parse(json, fallbackId = "id", fallbackName = "Broken")
+        assertNull(manifest.palette)
+    }
+
+    @Test
+    fun `a palette with an invalid colour string is dropped`() {
+        val json = """
+            {"name": "Broken", "palette": {
+                "lightest": "not a colour", "light": "#CCCCCC", "dark": "#333333",
+                "darkest": "#000000", "surround": "#111111"
+            }}
+        """.trimIndent()
+        assertNull(ModManifest.parse(json, "id", "Broken").palette)
+    }
+
+    @Test
+    fun `a palette without its own id or label falls back to the mod's own name`() {
+        val json = """
+            {"name": "My Mod", "palette": {
+                "lightest": "#FFFFFF", "light": "#CCCCCC", "dark": "#333333",
+                "darkest": "#000000", "surround": "#111111"
+            }}
+        """.trimIndent()
+        val palette = ModManifest.parse(json, fallbackId = "abc123", fallbackName = "My Mod").palette!!
+        assertEquals("mod_abc123", palette.id)
+        assertEquals("MY MOD", palette.label)
+        assertTrue("tintsSprites should default to true", palette.tintsSprites)
+    }
+
+    @Test
+    fun `a colour works with or without its leading hash`() {
+        val json = """
+            {"palette": {
+                "lightest": "FFFFFF", "light": "#CCCCCC", "dark": "333333",
+                "darkest": "#000000", "surround": "111111"
+            }}
+        """.trimIndent()
+        val palette = ModManifest.parse(json, "id", "Name").palette!!
+        assertEquals(0xFFFFFFFF.toInt(), palette.lightest)
+        assertEquals(0xFF000000.toInt(), palette.darkest)
+    }
+}

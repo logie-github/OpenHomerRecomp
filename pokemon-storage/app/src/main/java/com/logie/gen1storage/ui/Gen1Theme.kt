@@ -1,0 +1,722 @@
+package com.logie.gen1storage.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
+import android.graphics.Bitmap
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.logie.gen1storage.R
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import androidx.compose.material3.Text as MaterialText
+
+/**
+ * The Generation I presentation layer.
+ *
+ * Four flat shades, hard black outlines, square corners, no gradients and no
+ * elevation. Everything is drawn with borders and solid fills so it stays crisp
+ * at any density — there is no bitmap to resample and therefore nothing to
+ * blur. Type is a monospace face at whole-pixel sizes with wide letter spacing,
+ * which reads as the Game Boy font without shipping one.
+ */
+object Gen1Palette {
+
+    /**
+     * The palette everything is drawn through. Snapshot state rather than a
+     * constant, so a change in OPTIONS repaints every screen at once —
+     * including the `drawBehind` lambdas, which read these getters directly.
+     */
+    var palette by mutableStateOf(GbPalette.ORIGINAL)
+
+    /**
+     * Whether the windows follow the palette as well as the screen behind them.
+     *
+     * On by default: a palette that stopped at the edge of every box left the
+     * app looking like two designs at once. BLACK ON WHITE BOXES turns it
+     * off, which is the cartridge's own look — it drew its text boxes black
+     * on white whatever the screen was tinted.
+     */
+    var windowsFollowPalette by mutableStateOf(true)
+
+    /** The four-shade ramp, lightest to darkest. Always the chosen palette. */
+    val Lightest: Color get() = palette.lightest
+    val Light: Color get() = palette.light
+    val Dark: Color get() = palette.dark
+    val Darkest: Color get() = palette.darkest
+
+    /** The screen behind every window, as the console letterboxes it. */
+    val Surround: Color get() = Gen1Mod.theme.surround ?: palette.surround
+
+    // Window chrome. Black on white unless the player says otherwise — or
+    // unless a mod named one of these outright, which is the only way to get
+    // a dark window with bright text: the ramp alone cannot say that, since
+    // a window is always filled with its lightest shade and written in its
+    // darkest.
+    val Ink: Color get() = Gen1Mod.theme.ink ?: if (windowsFollowPalette) palette.darkest else MonoInk
+    val Panel: Color get() = Gen1Mod.theme.panel ?: if (windowsFollowPalette) palette.lightest else MonoPanel
+    val Shadow: Color get() = Gen1Mod.theme.shadow ?: if (windowsFollowPalette) palette.dark else MonoShadow
+    val Muted: Color get() = Gen1Mod.theme.muted ?: if (windowsFollowPalette) palette.light else MonoMuted
+
+    /** The bar along the top, which is the palette's own ink and paper reversed. */
+    val Bar: Color get() = Gen1Mod.theme.barFill ?: palette.darkest
+    val BarText: Color get() = Gen1Mod.theme.barText ?: palette.lightest
+
+    private val MonoInk = Color(0xFF101010)
+    private val MonoPanel = Color(0xFFF8F8F8)
+    private val MonoShadow = Color(0xFF686868)
+    private val MonoMuted = Color(0xFFC8C8C8)
+}
+
+/**
+ * The Generation I face itself, bundled with the app.
+ *
+ * It is a vector font drawing square pixels rather than a bitmap one, so it
+ * carries the same rule any pixel font does: it is only crisp when one design
+ * pixel lands on a whole number of device pixels.
+ *
+ * Measured from the source rather than taken on faith — the project's own
+ * README says to use multiples of ten, which does not hold. The em is 320
+ * units and all but a handful of the Latin outline coordinates are multiples
+ * of 40, so one design pixel is an **eighth** of the em: in that grid a capital
+ * is 7 pixels tall, the advance is 8, and the ascender is 10. A size that is a whole
+ * multiple of eight device pixels therefore puts every glyph edge on a pixel
+ * boundary, and any other size hands the anti-aliaser a fractional edge to
+ * soften. [pixelSize] is what enforces it.
+ */
+val Gen1DefaultFontFamily = FontFamily(Font(R.font.pokemon_font))
+
+/**
+ * The face actually drawn with. Snapshot state, like [Gen1Palette.palette] —
+ * a mod that bundles its own `.ttf` swaps this out, and every [Gen1BaseText]
+ * read after that draws with it instead. The grid in [snapFontPixels] is
+ * measured off the built-in face's own metrics, not whatever is loaded here,
+ * so layout never moves when the face does; a mod's own face may simply sit
+ * less exactly on it than the one this was tuned for.
+ */
+var Gen1FontFamily by mutableStateOf(Gen1DefaultFontFamily)
+
+/** Device pixels per design pixel step. The em is eight of these. */
+private const val FONT_GRID_PX = 8
+
+/**
+ * How tall the body em wants to be before it is snapped to the grid.
+ *
+ * One number for the whole interface: the type, the window borders, the
+ * sprites and the status pages are all measured in Game Boy pixels off the
+ * size this settles on, so there is exactly one grid and nothing can drift off
+ * it. Three device pixels per Game Boy pixel at a typical phone density.
+ */
+private val BodyEm = 6.5.dp * UI_SCALE
+
+/** The scale everything is drawn at. */
+const val UI_SCALE = 3
+
+/** Extra line height, as a fraction of the em, before snapping. */
+private const val LEADING = 0.4f
+
+/**
+ * A grid-aligned type size.
+ *
+ * [steps] moves in whole design-pixel steps away from the body size, so every
+ * size in the app stays a multiple of eight device pixels however dense the
+ * screen is. The result is converted back through the density, which also
+ * absorbs the user's font scale — so what comes out renders at exactly the
+ * pixel count asked for.
+ */
+@Composable
+private fun pixelSize(steps: Int): Pair<TextUnit, TextUnit> {
+    val density = LocalDensity.current
+    return with(density) {
+        val (size, leading) = snapFontPixels(BodyEm.toPx(), steps)
+        size.toFloat().toSp() to leading.toFloat().toSp()
+    }
+}
+
+/**
+ * The grid arithmetic, as size and leading in device pixels.
+ *
+ * Kept separate from the composable so the one claim the whole presentation
+ * rests on — that every size is a whole multiple of the grid — is checkable
+ * without a screen.
+ *
+ * The leading is about four tenths again, snapped to the same grid so
+ * baselines land on pixels too. The face's own line box is 1.375 em, so this
+ * always leaves it room rather than compressing it.
+ */
+internal fun snapFontPixels(bodyPx: Float, steps: Int): Pair<Int, Int> {
+    val body = (Math.round(bodyPx / FONT_GRID_PX) * FONT_GRID_PX)
+        .coerceAtLeast(FONT_GRID_PX * 3)
+    val size = (body + steps * FONT_GRID_PX).coerceAtLeast(FONT_GRID_PX * 2)
+    // Rounded up, never to nearest: rounding down here is what would push the
+    // line box under the face's own and have the renderer compress it.
+    val leading = size + (ceil(size * LEADING / FONT_GRID_PX).toInt() * FONT_GRID_PX)
+        .coerceAtLeast(FONT_GRID_PX)
+    return size to leading
+}
+
+/**
+ * One Game Boy pixel, in device pixels.
+ *
+ * The em is eight of these, so taking the snapped type size and dividing by
+ * eight gives the grid everything else is measured against — a whole number by
+ * construction, which is what keeps the borders and the sprites as square as
+ * the type.
+ */
+@Composable
+fun gen1PixelPx(): Int {
+    val density = LocalDensity.current
+    return with(density) { snapFontPixels(BodyEm.toPx(), 0).first / FONT_GRID_PX }
+}
+
+/** [gamePixels] of the shared grid, as a layout measurement. */
+@Composable
+fun gen1Dp(gamePixels: Int): Dp {
+    val pixel = gen1PixelPx()
+    return with(LocalDensity.current) { (gamePixels * pixel).toDp() }
+}
+
+/**
+ * The three type sizes, read fresh on every composition.
+ *
+ * They are composable getters rather than constants because both halves of a
+ * style are now context: the ink colour is a setting, and the size depends on
+ * the screen's density.
+ */
+val Gen1Text: TextStyle
+    @Composable get() {
+        val (size, leading) = pixelSize(0)
+        return Gen1BaseText.copy(fontSize = size, lineHeight = leading, color = Gen1Palette.Ink)
+    }
+
+val Gen1TextSmall: TextStyle
+    @Composable get() {
+        val (size, leading) = pixelSize(-1)
+        return Gen1BaseText.copy(fontSize = size, lineHeight = leading, color = Gen1Palette.Shadow)
+    }
+
+/** Small enough to fit two words across a cartridge's label. */
+val Gen1TextTiny: TextStyle
+    @Composable get() {
+        val (size, leading) = pixelSize(-2)
+        return Gen1BaseText.copy(fontSize = size, lineHeight = leading, color = Gen1Palette.Ink)
+    }
+
+val Gen1TextLarge: TextStyle
+    @Composable get() {
+        val (size, leading) = pixelSize(2)
+        return Gen1BaseText.copy(fontSize = size, lineHeight = leading, color = Gen1Palette.Ink)
+    }
+
+/**
+ * Everything that does not depend on the palette or the density.
+ *
+ * No synthetic bold: the face has one weight, and asking for another would have
+ * the renderer smear the glyphs sideways to fake it. No letter spacing either —
+ * the advances are already whole design pixels, and adding a fraction of one
+ * would push every glyph after the first off the grid.
+ */
+private val Gen1BaseText: TextStyle
+    get() = TextStyle(
+        fontFamily = Gen1FontFamily,
+        fontWeight = FontWeight.Normal,
+        letterSpacing = 0.sp,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+    )
+
+/**
+ * The screen behind the windows: the palette's ramp, top to bottom, dithered.
+ *
+ * There is no gradient here and no blending of any kind. A Game Boy could not
+ * mix two colours, so a designer wanting a tone between them alternated pixels
+ * of each and let the eye do the mixing — and the density of that alternation
+ * is what carried the shading. This does the same thing: every pixel on screen
+ * is one of the palette's own colours, and only how many of each changes as
+ * the eye travels down.
+ *
+ * The pattern is an ordered dither against an 8x8 Bayer matrix, which is the
+ * arrangement that spreads the minority colour as evenly as possible instead of
+ * clumping it. That is what produces the sparse dots at each end and the clean
+ * checkerboard where two colours meet.
+ *
+ * The darkest shade is deliberately not in the ramp. It is the ink the windows
+ * are drawn in, and a background that reaches it leaves their rules with
+ * nothing to sit against.
+ */
+@Composable
+fun Modifier.gen1Ground(): Modifier {
+    val palette = Gen1Palette.palette
+    val unit = with(LocalDensity.current) {
+        (density.roundToInt() * DITHER_SCALE).coerceAtLeast(2)
+    }
+    // Remembered so the draw cache is not handed a fresh array — and a fresh
+    // reason to rebuild the whole ramp — on every recomposition.
+    val ramp = remember(palette) {
+        intArrayOf(palette.lightest.toArgb(), palette.light.toArgb(), palette.dark.toArgb())
+    }
+
+    // The ramp belongs to the window, never to whatever happens to be carrying
+    // it. Measured off the element instead, a half-width column beside a menu
+    // ran the whole light-to-dark ramp over its own height and a shorter one
+    // over its own, so the two disagreed about what colour a given line of the
+    // screen was and left a seam straight down the middle — the ground visibly
+    // stepping where a window began. One strip, one height, and every piece of
+    // ground on screen reads the same row of it at the same height.
+    val windowHeight = LocalWindowInfo.current.containerSize.height.coerceAtLeast(1)
+    val windowWidth = LocalWindowInfo.current.containerSize.width.coerceAtLeast(1)
+    val image = remember(unit, windowHeight, ramp) { ditherRamp(unit, windowHeight, ramp) }
+    // Repeated across, clamped down: the strip is already the window's height,
+    // so only the horizontal axis has anything to tile.
+    val brush = remember(image) {
+        ShaderBrush(ImageShader(image, TileMode.Repeated, TileMode.Clamp))
+    }
+
+    // A mod's own picture, if it brought one, tiled or fitted across the same
+    // window-sized area the dither strip covers — so it lands under every
+    // piece of ground at the same place, for the same reason the strip does.
+    val modBackground = Gen1Mod.theme.background
+    val modFit = Gen1Mod.theme.backgroundFit
+    val backgroundBrush = remember(modBackground, modFit) {
+        if (modBackground != null && modFit == Gen1ModTheme.Fit.TILE) {
+            ShaderBrush(ImageShader(modBackground, TileMode.Repeated, TileMode.Repeated))
+        } else {
+            null
+        }
+    }
+
+    // The ball lies on the ground in window coordinates, the same as the ramp
+    // does, so a window sitting over part of it hides that part and the pieces
+    // of ground either side of a window still agree about where it is.
+    val ballInk = palette.lightest.toArgb()
+    // Held still rather than taken away: the ball is a graphic as much as a
+    // movement, so REDUCE MOTION stops it turning and leaves it drawn. A mod
+    // may also have said its own emblem does not turn at all.
+    val modBall = Gen1Mod.theme.ball
+    val turns = Gen1Motion.moves(Motion.BALL) && (modBall == null || Gen1Mod.theme.ballSpins)
+    // Rasterised off the main thread; the draw lambda only ever blits what is
+    // ready. See [Gen1Pokeball.drive] — with a mod's own ball in force there
+    // is nothing to rasterise and the drive only keeps the angle moving.
+    LaunchedEffect(windowWidth, windowHeight, unit, ballInk, turns, modBall) {
+        Gen1Pokeball.drive(windowWidth, windowHeight, unit, ballInk, turns)
+    }
+
+    // Where this piece of ground sits in the window, so the strip can be drawn
+    // from the window's top corner and then cut to the piece. Read inside the
+    // draw lambda, so moving only ever costs a redraw.
+    var origin by remember { mutableStateOf(Offset.Zero) }
+    return this
+        .onGloballyPositioned { origin = it.positionInRoot() }
+        .drawBehind {
+            val area = size
+            // Cut to this piece of ground before anything is drawn on it.
+            // `drawBehind` does not clip, and the ball is drawn at the whole
+            // window's size: without this it spilled out past whatever was
+            // carrying the ground and over the bar along the top.
+            clipRect(0f, 0f, area.width, area.height) {
+                translate(left = -origin.x, top = -origin.y) {
+                    when {
+                        backgroundBrush != null ->
+                            drawRect(backgroundBrush, topLeft = origin, size = area)
+                        modBackground != null ->
+                            drawModBackground(modBackground, modFit, windowWidth, windowHeight)
+                        else -> drawRect(brush, topLeft = origin, size = area)
+                    }
+                    if (modBall != null) {
+                        // A mod's ball is one picture of a whole ball, turned
+                        // about the corner it is centred on rather than
+                        // redrawn at each angle. Its own art decides whether
+                        // that reads as pixels or as anything else.
+                        rotate(
+                            degrees = Gen1Pokeball.angleDegrees,
+                            pivot = Offset(windowWidth.toFloat(), windowHeight.toFloat()),
+                        ) {
+                            val diameter = windowWidth.toFloat()
+                            drawImage(
+                                image = modBall,
+                                dstOffset = IntOffset(
+                                    (windowWidth - diameter / 2f).roundToInt(),
+                                    (windowHeight - diameter / 2f).roundToInt(),
+                                ),
+                                dstSize = IntSize(diameter.roundToInt(), diameter.roundToInt()),
+                                filterQuality = Gen1Mod.theme.filter,
+                            )
+                        }
+                    } else {
+                        // Read here rather than in composition: a turn of the ball
+                        // is a redraw and nothing more.
+                        val ball = Gen1Pokeball.current
+                        if (ball != null) {
+                            drawImage(
+                                image = ball.image,
+                                // Anchored to the window's bottom right, which is
+                                // the ball's own centre.
+                                dstOffset = IntOffset(
+                                    windowWidth - ball.cellsWide * unit,
+                                    windowHeight - ball.cellsHigh * unit,
+                                ),
+                                dstSize = IntSize(ball.cellsWide * unit, ball.cellsHigh * unit),
+                                // Whole multiples of one cell; smoothing would undo
+                                // the thing that makes it pixels.
+                                filterQuality = FilterQuality.None,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+}
+
+/**
+ * A mod's own background, drawn over the whole window.
+ *
+ * STRETCH puts the picture on the window whatever that does to its shape.
+ * COVER keeps the shape and fills the window with it, which means the
+ * picture is scaled to the larger of the two ratios and overhangs the other
+ * axis — the ground is already clipped to whatever is carrying it, so the
+ * overhang costs nothing but the part of the picture nobody sees.
+ */
+private fun DrawScope.drawModBackground(
+    image: ImageBitmap,
+    fit: Gen1ModTheme.Fit,
+    windowWidth: Int,
+    windowHeight: Int,
+) {
+    if (image.width <= 0 || image.height <= 0) return
+    val scale = when (fit) {
+        Gen1ModTheme.Fit.STRETCH -> null
+        else -> maxOf(
+            windowWidth.toFloat() / image.width,
+            windowHeight.toFloat() / image.height,
+        )
+    }
+    val drawWidth = scale?.let { (image.width * it).roundToInt() } ?: windowWidth
+    val drawHeight = scale?.let { (image.height * it).roundToInt() } ?: windowHeight
+    drawImage(
+        image = image,
+        // Centred on the window, so a picture wider than the screen loses
+        // the same amount from each side rather than all of it from one.
+        dstOffset = IntOffset((windowWidth - drawWidth) / 2, (windowHeight - drawHeight) / 2),
+        dstSize = IntSize(drawWidth, drawHeight),
+        filterQuality = Gen1Mod.theme.filter,
+    )
+}
+
+/**
+ * One Bayer tile wide and the full height tall, so the whole ramp is a single
+ * strip the shader repeats sideways.
+ *
+ * Each row sits somewhere between two of the ramp's colours. A pixel takes the
+ * later colour when that fraction clears the matrix's threshold for its
+ * position, so at the start of a band almost none do, halfway through exactly
+ * half do in a checkerboard, and by the end almost all do.
+ */
+private fun ditherRamp(unit: Int, heightPx: Int, ramp: IntArray): ImageBitmap {
+    val width = BAYER_SIDE * unit
+    val pixels = IntArray(width * heightPx)
+    val bands = ramp.size - 1
+    val thresholds = FloatArray(BAYER_SIDE)
+
+    for (y in 0 until heightPx) {
+        val position = if (heightPx <= 1) 0f else y.toFloat() / (heightPx - 1)
+        val travelled = position * bands
+        val band = floor(travelled).toInt().coerceIn(0, bands - 1)
+        val into = travelled - band
+        val low = ramp[band]
+        val high = ramp[band + 1]
+
+        val cellY = (y / unit) % BAYER_SIDE
+        for (cellX in 0 until BAYER_SIDE) {
+            thresholds[cellX] = (BAYER_8X8[cellY * BAYER_SIDE + cellX] + 0.5f) / BAYER_LEVELS
+        }
+
+        val row = y * width
+        for (x in 0 until width) {
+            pixels[row + x] = if (into > thresholds[(x / unit) % BAYER_SIDE]) high else low
+        }
+    }
+    return Bitmap.createBitmap(pixels, width, heightPx, Bitmap.Config.ARGB_8888).asImageBitmap()
+}
+
+/** Device pixels per dither pixel, as a multiple of the screen's density. */
+private const val DITHER_SCALE = 2
+
+private const val BAYER_SIDE = 8
+private const val BAYER_LEVELS = (BAYER_SIDE * BAYER_SIDE).toFloat()
+
+/** The standard 8x8 ordered-dither matrix, 0..63. */
+private val BAYER_8X8 = intArrayOf(
+    0, 32, 8, 40, 2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44, 4, 36, 14, 46, 6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+    3, 35, 11, 43, 1, 33, 9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47, 7, 39, 13, 45, 5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21,
+)
+
+@Composable
+fun Gen1Theme(content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalGen1TextStyle provides Gen1Text, content = content)
+}
+
+private val LocalGen1TextStyle = compositionLocalOf { Gen1BaseText }
+
+@Composable
+fun GbText(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = Gen1Text,
+    maxLines: Int = Int.MAX_VALUE,
+) {
+    MaterialText(
+        text = text,
+        modifier = modifier,
+        style = style,
+        color = style.color,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/**
+ * The same, for a line whose parts are not all drawn the same way.
+ *
+ * One piece of text rather than several side by side, which is what lets
+ * [Gen1TypedLines] hold a window at its finished size while it types: two
+ * Texts in a row wrap independently and the pair of them changes height as
+ * the split between them moves.
+ */
+@Composable
+fun GbText(
+    text: AnnotatedString,
+    modifier: Modifier = Modifier,
+    style: TextStyle = Gen1Text,
+    maxLines: Int = Int.MAX_VALUE,
+) {
+    MaterialText(
+        text = text,
+        modifier = modifier,
+        style = style,
+        color = style.color,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/**
+ * A tap with nothing drawn under the finger.
+ *
+ * Material's default `clickable` paints a ripple, which on a flat four-shade
+ * interface reads as a smear across the window. The cursor already says what
+ * is selected, so nothing else needs to.
+ */
+fun Modifier.gen1Clickable(
+    enabled: Boolean = true,
+    /** See [gen1Tap] — CANCEL, BACK and a standalone button opt out of the rule below. */
+    standalone: Boolean = false,
+    onClick: () -> Unit,
+): Modifier = composed {
+    // Every tap in the app comes through here, which is why the swipe rule
+    // lives here rather than at each of the places that can be pressed, and
+    // why there is next to no way to opt out of it: a screen where some
+    // things answer to the cursor and some to the finger is the rule read as
+    // arbitrary. A choice worth taking is a choice the cursor can reach —
+    // [standalone] is the one named exception, and it is [gen1Tap]'s to
+    // grant, not this modifier's.
+    val take = gen1Tap(onClick, standalone)
+    clickable(
+        enabled = enabled,
+        interactionSource = remember { MutableInteractionSource() },
+        indication = null,
+        onClick = take,
+    )
+}
+
+/** The rectangular selection cursor: a filled arrow before the chosen row. */
+@Composable
+private fun Gen1Cursor(selected: Boolean) {
+    Box(Modifier.width(18.dp), contentAlignment = Alignment.Center) {
+        if (selected) {
+            GbText("▶")
+        }
+    }
+}
+
+/** A full-width action, drawn as its own small window so it reads as a button. */
+@Composable
+fun Gen1Button(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    /** Whether the cursor is on it, so a swipe can reach it like any row. */
+    selected: Boolean = false,
+) {
+    // No plate. These sit inside windows, and a bordered button inside a
+    // bordered window is two rules saying one thing — which is what made the
+    // options screen look like a stack of nested boxes. A choice inside a
+    // window is a word you press, the way the cartridge's are; a choice that
+    // stands on its own is a window itself, which is [Gen1BoxButton].
+    Box(
+        modifier
+            .heightIn(min = 48.dp)
+            .gen1Clickable(enabled = enabled, standalone = true, onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        GbText(
+            (if (selected && enabled) "▶" else "") + label.uppercase(),
+            style = Gen1Text.copy(color = if (enabled) Gen1Palette.Ink else Gen1Palette.Shadow),
+        )
+    }
+}
+
+/**
+ * A button that is a window rather than a plate.
+ *
+ * The Generation I screens have no button widget: what a player takes is
+ * always a window with a word in it. So this is the window itself, named by
+ * what it does and clickable across its whole face — no plate inside a box,
+ * which is two outlines saying one thing.
+ */
+@Composable
+fun Gen1BoxButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    /** Whether the cursor is on it, so a swipe can reach it like any row. */
+    selected: Boolean = false,
+) {
+    // The arrow stands outside the window rather than inside it. A cursor is
+    // the thing pointing at a choice; drawn within the border it becomes part
+    // of the choice, and the word it points at is no longer where the word on
+    // every other button is.
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.width(gen1Dp(CURSOR_PIXELS))) {
+            if (selected && enabled) GbText("▶", style = Gen1Text)
+        }
+        Gen1FrameBox(modifier.gen1Clickable(enabled = enabled, standalone = true, onClick = onClick)) {
+            GbText(
+                label.uppercase(),
+                style = Gen1Text.copy(color = if (enabled) Gen1Palette.Ink else Gen1Palette.Shadow),
+            )
+        }
+    }
+}
+
+/** A label/value pair as the status screens lay them out. */
+@Composable
+fun Gen1Field(label: String, value: String, modifier: Modifier = Modifier) {
+    // Stacked rather than in two columns: a fixed label column had no way to
+    // be right for both "STATUS" and "ON THIS DEVICE", and wrapped the short
+    // ones onto two lines to make room for the long ones.
+    Column(modifier) {
+        GbText(label.uppercase(), style = Gen1TextSmall, maxLines = 1)
+        GbText(value.uppercase(), maxLines = 1)
+    }
+}
+
+/**
+ * The three colours an HP bar is drawn in.
+ *
+ * `PAL_GREENBAR`, `PAL_YELLOWBAR` and `PAL_REDBAR` from pret/pokeyellow's
+ * Super Game Boy table, converted from its five-bit channels the way the
+ * hardware does it (`v shl 3 or v shr 2`). They never follow the chosen
+ * palette: the bar is the one place in the interface that has to mean
+ * something at a glance, and a red bar that is not red does not. A mod may
+ * still name its own three, since a mod is somebody deciding what their own
+ * interface looks like rather than a tint applied over it — but it has to
+ * say so outright, one colour at a time.
+ */
+object Gen1HpBarColors {
+    val Green: Color get() = Gen1Mod.theme.hpGreen ?: Color(0xFF00AD00)
+    val Yellow: Color get() = Gen1Mod.theme.hpYellow ?: Color(0xFFE7BD4A)
+    val Red: Color get() = Gen1Mod.theme.hpRed ?: Color(0xFFD64A31)
+}
+
+/** The HP bar, drawn as the flat three-state bar the games use. */
+@Composable
+fun Gen1HpBar(current: Int, max: Int, modifier: Modifier = Modifier) {
+    val fraction = if (max <= 0) 0f else (current.toFloat() / max).coerceIn(0f, 1f)
+    Box(
+        modifier
+            .fillMaxWidth()
+            .background(Gen1Palette.Ink)
+            .padding(2.dp)
+            .background(Gen1Palette.Panel)
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth(fraction)
+                .height(10.dp)
+                .background(
+                    when {
+                        fraction > 0.5f -> Gen1HpBarColors.Green
+                        fraction > 0.2f -> Gen1HpBarColors.Yellow
+                        else -> Gen1HpBarColors.Red
+                    }
+                )
+        )
+    }
+}
+
+/** The room the cursor takes beside a window it is pointing at. */
+private const val CURSOR_PIXELS = 10

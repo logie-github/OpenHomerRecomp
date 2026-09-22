@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Saves arrive over Gen1Recomp's own save-sync service; the app needs
+         no storage permission and touches no other app's files. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- A sprite download is hundreds of files. Without a foreground service
+         the system freezes the process the moment the app leaves the screen
+         and the download stops dead partway through. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Android 11 hides every other app from this one unless the manifest
+         names it. These are the two package ids Gen1Recomp ships under, and
+         its launch scheme, so the app can tell whether the game is installed
+         and open it — which is what makes a transfer reach a cartridge at
+         once, since the game syncs on the way into a save. -->
+    <queries>
+        <package android:name="com.theboisclub.pokemonred" />
+        <package android:name="com.theboisclub.pokemonred.androidfixes" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="gen1recomp++" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".StorageApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="false"
+        android:resizeableActivity="true"
+        android:theme="@style/Theme.Gen1Storage">
+
+        <!-- Every orientation and every posture: a foldable opening up is a
+             configuration change to handle, not one to refuse. The activity
+             takes the size changes itself so unfolding does not recreate it
+             and lose whatever was on screen. -->
+        <service
+            android:name=".download.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- How a rendered Pokémon card reaches another app. Cache only, not
+             exported, and a URI is granted per share rather than a folder
+             being opened up. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.shares"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_files" />
+        </provider>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+
+    </application>
+</manifest>

@@ -1,0 +1,469 @@
+package com.logie.gen1storage.sprites
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import java.io.File
+import java.util.Collections
+
+/**
+ * Sprites on disk, and which set each species is shown in.
+ *
+ * The files are the archive's enlarged art, untouched. Reducing them for the
+ * screen happens here, and it is deliberately **point sampling**: every
+ * ordinary downscale — `inSampleSize`, `createScaledBitmap` with filtering,
+ * Skia's default — averages neighbouring pixels, which is exactly what turns a
+ * hard pixel edge into a soft one. Taking one source pixel per destination
+ * pixel keeps every edge as sharp as the original upscale.
+ *
+ * A full-size decode is around 16 MB, so it happens once per sprite, is
+ * reduced immediately, and the large bitmap is recycled before returning. Only
+ * the reduced copies are cached.
+ */
+class SpriteStore(
+    private val directory: File,
+    private val prefs: SharedPreferences,
+) {
+
+    constructor(context: Context) : this(
+        File(context.filesDir, "sprites"),
+        context.getSharedPreferences("gen1storage-sprites", Context.MODE_PRIVATE),
+    )
+
+    /**
+     * Reduced sprites, kept by least-recently-used. Each is a few hundred
+     * kilobytes of heap rather than the source's sixteen megabytes, so a
+     * generous cache still costs little.
+     */
+    private val memory: MutableMap<String, ImageBitmap> =
+        Collections.synchronizedMap(object : LinkedHashMap<String, ImageBitmap>(48, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>?) = size > 60
+        })
+
+    /**
+     * The four shades the art is mapped onto, darkest first, or null to leave
+     * it alone. Set from the palette the player picked in OPTIONS.
+     */
+    private var tintId: String = "original"
+    private var tintRamp: IntArray? = null
+
+    /** The colours Generation II art carries, read off the files as they land. */
+    val gen2Colours = Gen2Sprites.Store(directory)
+
+    /**
+     * The player's own Red and Blue ROMs, if any — set once, from outside,
+     * because building one is its own store with its own directory and this
+     * one has no business owning it. A species with a ROM to read from is
+     * drawn from it instead of a download; nothing changes for a species —
+     * or a player — that has none.
+     */
+    var romStore: com.logie.gen1storage.rom.RomStore? = null
+
+    /**
+     * Whether every sprite takes the chosen palette, or each takes the
+     * colours of the game it came from.
+     *
+     * Off, a Gold sprite is the colours in its own file and a shiny one is
+     * the two the cartridge swapped in, while a Generation I sprite — which
+     * has no colours of its own, only four greys — takes its game's own
+     * palette out of [gameRamps]. On, all of it is tinted the one way, and a
+     * Generation II shiny then reads the palette backwards, which is the same
+     * idea the cartridge had: the same drawing, lit the other way round.
+     */
+    var gbcFollowsPalette: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            memory.clear()
+        }
+
+    /**
+     * Points every sprite at a palette. [id] takes part in the cache key, so a
+     * change repaints from the files rather than handing back the old colours.
+     */
+    fun setTint(id: String, ramp: IntArray?) {
+        if (id == tintId) return
+        tintId = id
+        tintRamp = ramp
+        memory.clear()
+    }
+
+    /**
+     * The four colours each game's own palette gives, keyed by game version
+     * id and darkest first, as [setTint]'s ramp is.
+     *
+     * This is what GBC SPRITES: ORIGINAL means for art that has no colours of
+     * its own. Generation II art carries the Game Boy Color's, and left to
+     * itself that is already "the colours of the game it came from";
+     * Generation I art is four greys and nothing else, so without this there
+     * was no such thing as Red's red — it fell through to whatever the app's
+     * palette happened to be, and a Red trainer card came out in the same
+     * colour as a Blue one.
+     *
+     * Supplied from outside because the palettes belong to the interface and
+     * this does not.
+     */
+    var gameRamps: Map<String, IntArray> = emptyMap()
+        set(value) {
+            field = value
+            memory.clear()
+        }
+
+    /**
+     * The ramp a picture out of [gameVersionId] is drawn through, or null to
+     * leave it in its own four shades.
+     *
+     * Following the palette, every game is drawn the same way and the game is
+     * not consulted. On ORIGINAL it is the only thing consulted.
+     */
+    private fun rampFor(gameVersionId: String?): IntArray? {
+        if (gbcFollowsPalette) return tintRamp
+        // Nothing came from nowhere. A sprite shown outside any save — the
+        // Pokedex's own list, the introduction's samples — has no game whose
+        // colours it could be asked for, and the app's palette is the only
+        // answer left.
+        return gameRamps[gameVersionId?.lowercase()] ?: tintRamp
+    }
+
+    /** What that ramp is called, for the cache key. */
+    private fun tintKeyFor(gameVersionId: String?): String {
+        if (gbcFollowsPalette) return tintId
+        val game = gameVersionId?.lowercase()
+        return if (game != null && game in gameRamps) "own:$game" else tintId
+    }
+
+    fun fileFor(set: SpriteSet, speciesId: String): File =
+        File(File(directory, set.id), "${spriteFileName(speciesId)}.png")
+
+    fun has(set: SpriteSet, speciesId: String): Boolean = fileFor(set, speciesId).isFile
+
+    /** Every set that has at least one sprite on disk, for the picker. */
+    fun installedSets(): List<SpriteSet> = SpriteSet.entries.filter { set ->
+        File(directory, set.id).listFiles().orEmpty().any { it.isFile }
+    }
+
+    fun countIn(set: SpriteSet): Int =
+        File(directory, set.id).listFiles().orEmpty().count { it.isFile }
+
+    val isEmpty: Boolean get() = installedSets().isEmpty()
+
+    /** Total bytes the downloaded sprites occupy, for the options screen. */
+    fun bytesOnDisk(): Long =
+        directory.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    // ------- per-species overrides
+
+    /** The set a species is pinned to, whichever game it is being viewed from. */
+    fun overrideFor(speciesId: String): SpriteSet? =
+        SpriteSet.fromId(prefs.getString(KEY_PREFIX + speciesId, null))
+
+    fun setOverride(speciesId: String, set: SpriteSet?) {
+        prefs.edit().apply {
+            if (set == null) remove(KEY_PREFIX + speciesId) else putString(KEY_PREFIX + speciesId, set.id)
+        }.apply()
+        memory.clear()
+    }
+
+    /**
+     * Which set to actually draw: the player's choice for this species, else
+     * the art of the game it came from, else any set that happens to have it.
+     */
+    fun resolve(speciesId: String, gameVersionId: String?): SpriteSet? {
+        overrideFor(speciesId)?.takeIf { has(it, speciesId) }?.let { return it }
+        val preferred = SpriteSet.forGameId(gameVersionId)
+        if (has(preferred, speciesId)) return preferred
+        // Within the generation it came from, and no further. A Pidgey out of
+        // a Red save falls back to Yellow's drawing of it, never to Gold's:
+        // they are different drawings and a box that mixed them would read as
+        // two games at once. Only the player picking a set for a species
+        // crosses that line.
+        return SpriteSet.entries.firstOrNull {
+            it.generation == preferred.generation && has(it, speciesId)
+        }
+    }
+
+    fun load(
+        speciesId: String,
+        gameVersionId: String?,
+        cutout: Boolean = false,
+        shiny: Boolean = false,
+    ): ImageBitmap? {
+        romVersionOf(gameVersionId)?.let { version ->
+            romStore?.frontSprite(version, speciesId)?.let {
+                return loadFromRom(speciesId, version, it, cutout)
+            }
+        }
+        val set = resolve(speciesId, gameVersionId) ?: return null
+        return load(set, speciesId, cutout, shiny, gameVersionId)
+    }
+
+    /**
+     * Where a downloaded Generation I sprite is a picture already drawn at
+     * some upscale, a ROM one is the cartridge's own 2bpp tiles decoded
+     * straight — no picture to point-sample down, only the same four-shade
+     * treatment [load] gives every other Generation I sprite, kept under its
+     * own cache key so a downloaded Red sprite for a species and a ROM-read
+     * one are never confused for each other.
+     */
+    private fun loadFromRom(
+        speciesId: String,
+        version: com.logie.gen1storage.rom.RomVersion,
+        sprite: com.logie.gen1storage.rom.Gen1SpriteCodec.DecodedSprite,
+        cutout: Boolean,
+    ): ImageBitmap {
+        // The cartridge is part of the key. Six ROMs draw the same species six
+        // ways, and without this the first one decoded answered for all of
+        // them: a Pokemon carried into Gold kept whichever drawing happened to
+        // be cached under its name, which on an account with every ROM
+        // imported is a coin toss rather than a picture of the right game.
+        val key = buildString {
+            append(tintKeyFor(version.id)).append("/rom/").append(version.id).append('/')
+            if (cutout) append("cut/")
+            append(spriteFileName(speciesId))
+        }
+        memory[key]?.let { return it }
+        val full = greyscaleOf(sprite)
+        val ramp = rampFor(version.id)
+        val shown = when {
+            ramp != null -> recolourToRamp(full, ramp, cutout)
+            cutout -> cutOutLightest(full)
+            else -> full
+        }
+        if (full !== shown) full.recycle()
+        val image = shown.asImageBitmap()
+        memory[key] = image
+        return image
+    }
+
+    /** A ROM sprite's 2bpp values (0-3), lightest first, as a plain greyscale bitmap. */
+    private fun greyscaleOf(sprite: com.logie.gen1storage.rom.Gen1SpriteCodec.DecodedSprite): Bitmap {
+        val bitmap = Bitmap.createBitmap(sprite.widthPx, sprite.heightPx, Bitmap.Config.ARGB_8888)
+        for (y in 0 until sprite.heightPx) {
+            for (x in 0 until sprite.widthPx) {
+                val shade = 255 - sprite.pixels[y * sprite.widthPx + x] * 85
+                bitmap.setPixel(x, y, (0xFF shl 24) or (shade shl 16) or (shade shl 8) or shade)
+            }
+        }
+        return bitmap
+    }
+
+    /**
+     * Where a species' picture comes from and what happens to it on the way,
+     * for the debug report.
+     *
+     * Three things decide what lands on screen and none of them are visible
+     * until one goes wrong: which source answered (an imported ROM, a
+     * downloaded file, or nothing), what size that source handed over, and
+     * what this store then did to it. A downloaded sprite is not used as it
+     * arrives — the Generation I sets are enlarged art, and [pointSample]
+     * divides them back down by a whole number — so the size that was
+     * fetched, the divisor, and the size actually kept are three different
+     * numbers and any of them can be the wrong one.
+     */
+    fun sourceOf(speciesId: String, gameVersionId: String?): String {
+        val version = romVersionOf(gameVersionId)
+        val store = romStore
+        if (version != null && store != null && store.has(version)) {
+            val decoded = runCatching { store.frontSprite(version, speciesId) }
+            decoded.getOrNull()?.let {
+                return "ROM ${version.id} (gen ${version.generation}): " +
+                    "decoded ${it.widthPx}x${it.heightPx}"
+            }
+            decoded.exceptionOrNull()?.let {
+                return "ROM ${version.id}: FAILED ${it::class.simpleName}: ${it.message}"
+            }
+            // No entry for this species in that ROM: the download answers
+            // instead, and what it answers with is worth saying too.
+        }
+        val set = resolve(speciesId, gameVersionId)
+            ?: return "nothing: no ROM entry and no set has it"
+        val file = fileFor(set, speciesId)
+        if (!file.isFile) return "download ${set.id}: no file on disk"
+        val bytes = runCatching { file.readBytes() }.getOrNull()
+            ?: return "download ${set.id}: file unreadable"
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds) }
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        val longest = maxOf(width, height)
+        val divisor = if (longest > DISPLAY_PIXELS) (longest / DISPLAY_PIXELS) else 1
+        val keptWidth = if (divisor > 1) width / divisor else width
+        val keptHeight = if (divisor > 1) height / divisor else height
+        return buildString {
+            append("download ${set.id}: PNG ${width}x$height, ${bytes.size}B")
+            if (!isCompletePng(bytes)) append(", INCOMPLETE PNG")
+            if (width <= 0) append(", WOULD NOT DECODE")
+            append("; /$divisor -> kept ${keptWidth}x$keptHeight")
+            // Whether that division was clean. An enlarged sprite is a whole
+            // number of screen pixels per art pixel; one that is not divides
+            // into a smear rather than a smaller copy of itself.
+            if (divisor > 1 && (width % divisor != 0 || height % divisor != 0)) {
+                append(" (UNEVEN)")
+            }
+        }
+    }
+
+    private fun romVersionOf(gameVersionId: String?): com.logie.gen1storage.rom.RomVersion? =
+        when (gameVersionId?.lowercase()) {
+            "red" -> com.logie.gen1storage.rom.RomVersion.RED
+            "blue" -> com.logie.gen1storage.rom.RomVersion.BLUE
+            "yellow" -> com.logie.gen1storage.rom.RomVersion.YELLOW
+            "gold" -> com.logie.gen1storage.rom.RomVersion.GOLD
+            "silver" -> com.logie.gen1storage.rom.RomVersion.SILVER
+            "crystal" -> com.logie.gen1storage.rom.RomVersion.CRYSTAL
+            else -> null
+        }
+
+    /**
+     * [cutout] drops the sprite's white field so it sits on whatever is behind
+     * it — see [recolourToRamp]. Kept under its own key, because the two are
+     * different pictures and a screen asking for one must not be handed the
+     * other.
+     */
+    fun load(
+        set: SpriteSet,
+        speciesId: String,
+        cutout: Boolean = false,
+        shiny: Boolean = false,
+        /** Which game this one is being shown out of, for [rampFor]. */
+        gameVersionId: String? = null,
+    ): ImageBitmap? {
+        val key = buildString {
+            append(tintKeyFor(gameVersionId)).append('/').append(set.id).append('/')
+            if (cutout) append("cut/")
+            if (shiny) append("shiny/")
+            if (set.generation == 2 && gbcFollowsPalette) append("tinted/")
+            append(spriteFileName(speciesId))
+        }
+        memory[key]?.let { return it }
+        val file = fileFor(set, speciesId)
+        if (!file.isFile) return null
+
+        val bytes = runCatching { file.readBytes() }.getOrNull()
+        if (bytes == null || !isCompletePng(bytes)) {
+            // A file the bulk downloader treats as "already have it" the
+            // moment it exists on disk at all — it never re-checks
+            // completeness, so a cartridge cached from before a download was
+            // made to reject a short read stayed exactly this broken forever.
+            // Deleted here instead, so has() reports it missing and the next
+            // download actually replaces it, rather than skipping it as done.
+            file.delete()
+            return null
+        }
+        val full = runCatching {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            })
+        }.getOrNull() ?: run {
+            file.delete()
+            return null
+        }
+
+        val reduced = runCatching { pointSample(full) }.getOrNull()
+        if (reduced == null) {
+            full.recycle()
+            return null
+        }
+        val shown = runCatching {
+            if (set.generation == 2) gen2(reduced, set, speciesId, cutout, shiny)
+            else {
+                val ramp = rampFor(gameVersionId)
+                when {
+                    ramp != null -> recolourToRamp(reduced, ramp, cutout)
+                    cutout -> cutOutLightest(reduced)
+                    else -> reduced
+                }
+            }
+        }.getOrNull() ?: reduced
+
+        // Recycle every intermediate that is not the bitmap being kept.
+        if (full !== shown) full.recycle()
+        if (reduced !== shown && reduced !== full) reduced.recycle()
+
+        val image = shown.asImageBitmap()
+        memory[key] = image
+        return image
+    }
+
+    /**
+     * Generation II art, which arrives already coloured.
+     *
+     * The file's own four entries are white, the light colour, the dark
+     * colour and black, in that order, and the pixels are those colours
+     * exactly — so the work is a swap of one for another rather than a tint
+     * of a grey. Which four they are swapped for is the whole of what varies:
+     *
+     *  - shown as the cartridge did, a shiny takes the pair out of its
+     *    `shiny.pal` and keeps white and black
+     *  - told to follow the palette, all four come from the palette, and a
+     *    shiny takes it backwards — the dark end where the light was
+     *
+     * A species whose colours were never written down is left exactly as the
+     * file has it, which is the normal picture.
+     */
+    private fun gen2(
+        source: Bitmap,
+        set: SpriteSet,
+        speciesId: String,
+        cutout: Boolean,
+        shiny: Boolean,
+    ): Bitmap {
+        val own = gen2Colours.normalOf(set, speciesId)?.takeIf { it.size >= 4 }
+            ?: return if (cutout) cutOutLightest(source) else source
+        val palette = tintRamp
+        val wanted = when {
+            gbcFollowsPalette && palette != null && palette.size >= 4 ->
+                // The ramp runs darkest first; the file's runs lightest
+                // first, so a straight read of one into the other is already
+                // the right way round for a shiny.
+                if (shiny) intArrayOf(palette[0], palette[1], palette[2], palette[3])
+                else intArrayOf(palette[3], palette[2], palette[1], palette[0])
+
+            shiny -> gen2Colours.shinyOf(speciesId)?.takeIf { it.size >= 2 }
+                ?.let { intArrayOf(own[0], it[0], it[1], own[3]) }
+
+            else -> null
+        } ?: return if (cutout) cutOutLightest(source) else source
+
+        return swapColours(source, own, wanted, cutout)
+    }
+
+    /**
+     * Reduces by taking one source pixel per destination pixel, never a blend.
+     *
+     * The divisor is a whole number, so each destination pixel lands on a
+     * consistent position within the source's upscale blocks and the result is
+     * the same art at a smaller size rather than a smeared version of it.
+     * `createScaledBitmap` is called with filtering off, which is Android's
+     * nearest-neighbour path.
+     */
+    private fun pointSample(source: Bitmap): Bitmap {
+        val longest = maxOf(source.width, source.height)
+        if (longest <= DISPLAY_PIXELS) return source
+        val divisor = longest / DISPLAY_PIXELS
+        if (divisor <= 1) return source
+        val width = (source.width / divisor).coerceAtLeast(1)
+        val height = (source.height / divisor).coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(source, width, height, false)
+    }
+
+    fun clear() {
+        directory.deleteRecursively()
+        prefs.edit().clear().apply()
+        memory.clear()
+    }
+
+    private companion object {
+        const val KEY_PREFIX = "set-for-"
+
+        /**
+         * The longest edge kept in memory. A sprite slot is about 96dp — 288
+         * pixels on a 3x screen — so this holds well above what any display
+         * needs while staying far below the source's two thousand.
+         */
+        const val DISPLAY_PIXELS = 480
+    }
+}

@@ -1,0 +1,729 @@
+package com.logie.gen1storage.ui
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
+import com.logie.gen1storage.sound.LocalGen1Audio
+import com.logie.gen1storage.sprites.FollowerStore
+import com.logie.gen1storage.sprites.SpriteStore
+import com.logie.gen1storage.storage.StorageBox
+import com.logie.gen1storage.storage.StorageLayout
+import com.logie.gen1storage.storage.StoredPokemon
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+
+/**
+ * One Pokémon as its overworld follower.
+ *
+ * Standing still by default and walking on the spot while the cursor is on it,
+ * which is the later games' box exactly: thirty of them moving at once is
+ * noise, one of them moving is what tells you which one you are looking at.
+ * Both frames face the player — the first standing, the other mid-step.
+ */
+@Composable
+fun FollowerSprite(
+    dexNumber: Int?,
+    store: FollowerStore,
+    revision: Int,
+    modifier: Modifier = Modifier,
+    sizeInPixels: Int = FollowerStore.SIZE,
+    /** Whether this is the one the cursor is on. */
+    animating: Boolean = false,
+) {
+    var idle by remember(dexNumber, revision) { mutableStateOf<ImageBitmap?>(null) }
+    var stepping by remember(dexNumber, revision) { mutableStateOf<ImageBitmap?>(null) }
+    var stepped by remember(dexNumber, revision) { mutableStateOf(false) }
+
+    LaunchedEffect(dexNumber, revision) {
+        if (dexNumber == null) return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            idle = store.frame(dexNumber, FollowerStore.FRAME_IDLE)
+            stepping = store.frame(dexNumber, FollowerStore.FRAME_STEP)
+        }
+    }
+
+    LaunchedEffect(dexNumber, revision, animating) {
+        // Standing is the resting state, so a Pokémon the cursor leaves is
+        // back on its feet the same frame rather than frozen mid-step.
+        stepped = false
+        if (dexNumber == null || !animating) return@LaunchedEffect
+        while (true) {
+            delay(FRAME_MILLIS)
+            stepped = !stepped
+        }
+    }
+
+    val shown = if (stepped) stepping ?: idle else idle
+    Box(modifier.size(gen1Dp(sizeInPixels)), contentAlignment = Alignment.Center) {
+        if (shown != null) {
+            Image(
+                bitmap = shown,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+                // These are 16 pixels square. Anything but nearest neighbour
+                // would turn them to soup at this magnification.
+                filterQuality = FilterQuality.None,
+            )
+        } else {
+            OccupiedMark()
+        }
+    }
+}
+
+/**
+ * What a spot shows when the follower sheets are not on the device: a filled
+ * marker, so the box still reads as arranged rather than empty.
+ *
+ * Hollow while the art is still being fetched and solid once it is not. A
+ * box of solid blocks says the art is missing; a box of outlines says it is
+ * on its way, which on a first run is what is actually happening. See
+ * [Gen1Loading].
+ */
+@Composable
+private fun OccupiedMark() {
+    val pixel = gen1PixelPx().toFloat()
+    val waiting = Gen1Loading.fetching
+    Box(
+        Modifier.fillMaxSize().drawBehind {
+            val inset = pixel * 4
+            val width = size.width - inset * 2
+            val height = size.height - inset * 2
+            if (!waiting) {
+                drawRect(Gen1Palette.Ink, Offset(inset, inset), Size(width, height))
+                return@drawBehind
+            }
+            drawRect(Gen1Palette.Ink, Offset(inset, inset), Size(width, pixel))
+            drawRect(Gen1Palette.Ink, Offset(inset, inset + height - pixel), Size(width, pixel))
+            drawRect(Gen1Palette.Ink, Offset(inset, inset), Size(pixel, height))
+            drawRect(Gen1Palette.Ink, Offset(inset + width - pixel, inset), Size(pixel, height))
+        }
+    )
+}
+
+/**
+ * The mark on a spot the player has ticked.
+ *
+ * A small filled square in the corner rather than anything drawn over the
+ * Pokémon: the sprite is how a spot is recognised, and a tick that covers it
+ * makes a ticked box unreadable.
+ */
+@Composable
+private fun TickMark() {
+    val pixel = gen1PixelPx().toFloat()
+    Box(
+        Modifier.fillMaxSize().drawBehind {
+            val side = pixel * TICK_PIXELS
+            drawRect(Gen1Palette.Ink, Offset(0f, 0f), Size(side, side))
+        }
+    )
+}
+
+/**
+ * The four corner brackets that mark the spot the cursor is on.
+ *
+ * Brackets rather than a box: a Pokémon is drawn right out to the edge of its
+ * spot, and an outline around one reads as a cage rather than a selection.
+ * Corners leave the sprite's own silhouette alone.
+ */
+@Composable
+private fun CursorBrackets(modifier: Modifier = Modifier) {
+    val pixel = gen1PixelPx().toFloat()
+    Box(
+        modifier.fillMaxSize().drawBehind {
+            val arm = pixel * BRACKET_ARM_PIXELS
+            val thick = pixel
+            val right = size.width - thick
+            val bottom = size.height - thick
+            // Each corner is two strokes: one across, one down.
+            drawRect(Gen1Palette.Ink, Offset(0f, 0f), Size(arm, thick))
+            drawRect(Gen1Palette.Ink, Offset(0f, 0f), Size(thick, arm))
+            drawRect(Gen1Palette.Ink, Offset(size.width - arm, 0f), Size(arm, thick))
+            drawRect(Gen1Palette.Ink, Offset(right, 0f), Size(thick, arm))
+            drawRect(Gen1Palette.Ink, Offset(0f, bottom), Size(arm, thick))
+            drawRect(Gen1Palette.Ink, Offset(0f, size.height - arm), Size(thick, arm))
+            drawRect(Gen1Palette.Ink, Offset(size.width - arm, bottom), Size(arm, thick))
+            drawRect(Gen1Palette.Ink, Offset(right, size.height - arm), Size(thick, arm))
+        }
+    )
+}
+
+/**
+ * The box as a grid: six across, a hundred down, scrolling.
+ *
+ * The gestures live on each row rather than on the grid as a whole, because a
+ * hundred rows have to be a lazy list and a lazy list has no single surface to
+ * put one detector on. A row knows which row it is, so a tap needs only the
+ * column; a drag converts its own position into the grid's so it can still be
+ * dragged over a neighbour the way it always could.
+ */
+@Composable
+fun Gen1BoxGrid(
+    box: StorageBox,
+    followers: FollowerStore,
+    revision: Int,
+    /** Where the cursor is sitting, bracketed and walking on the spot. */
+    cursorSlot: Int?,
+    onTap: (Int) -> Unit,
+    onMove: (from: Int, to: Int) -> Unit,
+    modifier: Modifier = Modifier,
+    /** Spots the player has ticked, for an action about to act on several. */
+    marked: Set<Int> = emptySet(),
+    /**
+     * A hold that went nowhere.
+     *
+     * Dragging swaps two spots and is the right gesture for two that are near
+     * each other. This box is a hundred rows deep, so the two are often not:
+     * holding one and then holding the other is the same swap without the
+     * finger having to travel.
+     */
+    onHold: (Int) -> Unit = {},
+) {
+    val cell = gen1Dp(CELL_PIXELS)
+    val cellPx = with(LocalDensity.current) { cell.toPx() }
+    val columns = StorageLayout.BOX_COLUMNS
+    val rows = StorageLayout.BOX_ROWS
+    val scroll = rememberLazyListState()
+    val cries = LocalGen1Audio.current
+    // With swipes on the bracket is walked to a spot and then pressed: a tap
+    // anywhere is the A button and A takes whatever the cursor is holding,
+    // which may be a spot in this grid or one of the rows under it. So the
+    // tap goes to the cursor rather than to the cell it landed on — the cry
+    // included, which otherwise spoke for one Pokemon while another was
+    // taken. See [gen1Tap], which says the same for every other tap.
+    val tapTakesCursor = LocalGen1Swipe.current
+    val whole = LocalGen1Cursor.current
+
+    // Every row is exactly one cell tall, so how far the list has travelled is
+    // arithmetic rather than a measurement.
+    fun scrolledPx(): Float =
+        scroll.firstVisibleItemIndex * cellPx + scroll.firstVisibleItemScrollOffset
+
+    /** A point on the grid's own face, scrolling included, as a spot. */
+    fun slotAt(onGrid: Offset): Int? {
+        val column = (onGrid.x / cellPx).toInt()
+        val row = ((onGrid.y + scrolledPx()) / cellPx).toInt()
+        if (column !in 0 until columns || row !in 0 until rows) return null
+        return row * columns + column
+    }
+
+    var gridTop by remember { mutableFloatStateOf(0f) }
+    var dragFrom by remember { mutableIntStateOf(-1) }
+    // Where the hold began, occupied or not: an empty spot cannot be dragged
+    // but can certainly be held, which is how something is put down on one.
+    var heldAt by remember { mutableIntStateOf(-1) }
+    // Where the finger is, on the grid's face.
+    var dragAt by remember { mutableStateOf<Offset?>(null) }
+
+    // The box arrives a column at a time rather than all at once, which is how
+    // the games change anything that fills the screen. Only on the way in: a
+    // box that did this every time it was scrolled would be unusable.
+    var revealed by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (revealed < columns) {
+            delay(COLUMN_MILLIS)
+            revealed++
+        }
+    }
+
+    // The cursor can walk past the bottom of what is on screen, so the list
+    // follows it. Only when it has actually gone out of sight — scrolling on
+    // every step would drag the whole box about under a cursor that was
+    // perfectly visible where it was.
+    LaunchedEffect(cursorSlot) {
+        val row = (cursorSlot ?: return@LaunchedEffect) / columns
+        val first = scroll.firstVisibleItemIndex
+        val visible = scroll.layoutInfo.visibleItemsInfo
+        val last = visible.lastOrNull()?.index ?: first
+        if (row <= first) scroll.scrollToRow(row)
+        // Stops one short of the end so the row lands inside the window rather
+        // than half under its bottom edge.
+        else if (row >= last) scroll.scrollToRow((row - (last - first) + 1).coerceAtLeast(0))
+    }
+
+    Box(
+        modifier
+            .width(cell * columns)
+            .onGloballyPositioned { gridTop = it.positionInRoot().y }
+    ) {
+        LazyColumn(state = scroll, userScrollEnabled = !LocalGen1Swipe.current) {
+            items(rows, key = { it }) { row ->
+                var rowTop by remember { mutableFloatStateOf(0f) }
+
+                fun onGrid(local: Offset) = Offset(local.x, rowTop - gridTop + local.y)
+
+                Row(
+                    Modifier
+                        .onGloballyPositioned { rowTop = it.positionInRoot().y }
+                        // Claims the hold, so picking a Pokémon up is not also
+                        // a request to go back a screen.
+                        .gen1HoldRegion()
+                        .pointerInput(row, columns, cellPx) {
+                            detectTapGestures { at ->
+                                if (tapTakesCursor) {
+                                    cursorSlot?.let { slot ->
+                                        box.slots.getOrNull(slot)?.pokemon?.let { mon ->
+                                            mon.species?.dexNumber
+                                                ?.let { cries?.cry(it, mon.generation) }
+                                        }
+                                    }
+                                    whole.confirm()
+                                    return@detectTapGestures
+                                }
+                                slotAt(onGrid(at))?.let {
+                                    // It speaks when it is touched, the way the
+                                    // sprite on the status screen does.
+                                    box.slots.getOrNull(it)?.pokemon?.let { mon ->
+                                        mon.species?.dexNumber
+                                            ?.let { dex -> cries?.cry(dex, mon.generation) }
+                                    }
+                                    onTap(it)
+                                }
+                            }
+                        }
+                        .pointerInput(row, columns, cellPx) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = { at ->
+                                    val slot = slotAt(onGrid(at))
+                                    heldAt = slot ?: -1
+                                    dragFrom =
+                                        if (slot != null && box.slots.getOrNull(slot) != null) slot
+                                        else -1
+                                    dragAt = onGrid(at)
+                                },
+                                onDrag = { change, _ ->
+                                    change.consume()
+                                    dragAt = onGrid(change.position)
+                                },
+                                onDragEnd = {
+                                    val to = dragAt?.let(::slotAt)
+                                    when {
+                                        dragFrom >= 0 && to != null && to != dragFrom ->
+                                            onMove(dragFrom, to)
+                                        // Held and let go on the same spot,
+                                        // which is a hold rather than a drag.
+                                        heldAt >= 0 && (to == null || to == heldAt) ->
+                                            onHold(heldAt)
+                                    }
+                                    dragFrom = -1
+                                    heldAt = -1
+                                    dragAt = null
+                                },
+                                onDragCancel = {
+                                    dragFrom = -1
+                                    heldAt = -1
+                                    dragAt = null
+                                },
+                            )
+                        }
+                ) {
+                    repeat(columns) { column ->
+                        val slot = row * columns + column
+                        val stored = box.slots.getOrNull(slot)
+                        // Nothing drawn around a Pokémon: six hundred ruled-off
+                        // cells stop reading as a boxful and start reading as a
+                        // table. Only the one under the cursor is marked.
+                        Box(Modifier.size(cell), contentAlignment = Alignment.Center) {
+                            if (slot == cursorSlot) CursorBrackets()
+                            if (slot in marked) TickMark()
+                            // The one being carried is not drawn in its old
+                            // spot: it is under the finger.
+                            if (stored != null && slot != dragFrom && column < revealed) {
+                                // An egg has no species to draw, by design:
+                                // Gen1Pokemon.species is null for one, so the
+                                // spot shows the marker rather than giving
+                                // away what is inside.
+                                FollowerSprite(
+                                    stored.pokemon.species?.dexNumber,
+                                    followers,
+                                    revision,
+                                    sizeInPixels = SPRITE_PIXELS,
+                                    animating = slot == cursorSlot,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val carried = dragAt
+        val carriedMon = box.slots.getOrNull(dragFrom)
+        if (carried != null && carriedMon != null) {
+            val half = with(LocalDensity.current) { (cellPx / 2).toInt() }
+            Box(
+                Modifier.offset {
+                    IntOffset(carried.x.toInt() - half, carried.y.toInt() - half)
+                }
+            ) {
+                FollowerSprite(
+                    carriedMon.pokemon.species?.dexNumber,
+                    followers,
+                    revision,
+                    sizeInPixels = SPRITE_PIXELS,
+                    animating = true,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * What the cursor is standing on, read off the way the status screen reads a
+ * Pokémon: the front sprite, the name, the level, the types, the number.
+ *
+ * No HP, no status. Those are facts about a Pokémon in play; a box is where
+ * they are not in play, and putting a health bar over thirty resting Pokémon
+ * only invited the question of why it never moves.
+ *
+ * Every line is drawn whether or not there is anything to put in it, so the
+ * block is the same height on an empty spot as on a full one and the grid
+ * underneath never shifts as the cursor walks.
+ */
+@Composable
+private fun BoxHead(
+    stored: StoredPokemon?,
+    sprites: SpriteStore,
+    spriteRevision: Int,
+    modifier: Modifier = Modifier,
+) {
+    val pokemon = stored?.pokemon
+    val types = pokemon?.species?.types.orEmpty()
+    val end = Gen1Text.copy(textAlign = TextAlign.End)
+    Row(modifier) {
+        Column(Modifier.width(gen1Dp(HEAD_SPRITE_PIXELS))) {
+            // An empty spot leaves the block blank rather than showing the
+            // bracketed mark: the mark means "there is no art for this one",
+            // and on an empty spot there is no "this one" to have art.
+            if (pokemon == null) {
+                Spacer(Modifier.size(gen1Dp(HEAD_SPRITE_PIXELS)))
+            } else {
+                Gen1Sprite(
+                    pokemon.spriteSpeciesId(),
+                    stored.spriteGameVersionId,
+                    sprites,
+                    revision = spriteRevision,
+                    sizeInPixels = HEAD_SPRITE_PIXELS,
+                    shiny = pokemon.isShiny,
+                )
+            }
+            Spacer(Modifier.height(gen1Dp(2)))
+            GbText(
+                pokemon?.species?.let { "No.%03d".format(it.dexNumber) } ?: " ",
+                maxLines = 1,
+            )
+        }
+        Spacer(Modifier.width(gen1Dp(4)))
+        Gen1CornerRule(Modifier.weight(1f)) {
+            GbText(
+                pokemon?.displayName?.uppercase() ?: " ",
+                modifier = Modifier.fillMaxWidth(),
+                style = end,
+                maxLines = 1,
+            )
+            GbText(
+                pokemon?.let { ":L${it.level}" } ?: " ",
+                modifier = Modifier.fillMaxWidth(),
+                style = end,
+                maxLines = 1,
+            )
+            Spacer(Modifier.height(gen1Dp(2)))
+            GbText(if (pokemon == null) " " else "TYPE1/", maxLines = 1)
+            GbText(if (pokemon == null) " " else " ${types.getOrNull(0) ?: "---"}", maxLines = 1)
+            GbText(if (pokemon == null) " " else "TYPE2/", maxLines = 1)
+            GbText(if (pokemon == null) " " else " ${types.getOrNull(1) ?: "---"}", maxLines = 1)
+        }
+    }
+}
+
+/**
+ * The window VIEW BOXES opens: what the cursor is on, the box, and the way
+ * between boxes.
+ *
+ * Laid out the way the later games lay a PC out — the one being looked at
+ * across the top, the grid under it — but drawn as one Generation I window, so
+ * it sits on the same screen as the menu it came from rather than replacing it.
+ *
+ * There is one box and it scrolls, so there is nowhere else to go: the cursor
+ * walks down it and the grid follows. It stops at the left and right edges
+ * rather than wrapping, because a row is a row.
+ */
+@Composable
+fun BoxGridOverlay(
+    box: StorageBox,
+    followers: FollowerStore,
+    sprites: SpriteStore,
+    revision: Int,
+    /** What the caption says while a Pokémon is waiting to be put down. */
+    heldName: String?,
+    /**
+     * Where the cursor starts. Coming back from a Pokémon's stats, that is the
+     * one just looked at — otherwise the cursor would be back at the first
+     * spot and the second press would ask about the wrong Pokémon.
+     */
+    startSlot: Int?,
+    onTap: (Int) -> Unit,
+    onMove: (from: Int, to: Int) -> Unit,
+    onCancel: () -> Unit,
+    /**
+     * Which spot the cursor is on, as it moves — for the pane beside the box
+     * on a screen wide enough to have one.
+     */
+    onHighlight: (Int) -> Unit = {},
+    /** Spots ticked for whatever [actionLabel] is about to do to them. */
+    marked: Set<Int> = emptySet(),
+    /** A hold that went nowhere: picking one up, or putting one down. */
+    onHold: (Int) -> Unit = {},
+    /**
+     * The one thing several ticked Pokémon can be sent to do, when there are
+     * any. A button under the box rather than a row inside it: it acts on the
+     * whole selection, not on the spot the cursor happens to be over.
+     */
+    actionLabel: String? = null,
+    onAction: () -> Unit = {},
+    /**
+     * Naming the box, from the line that says which box it is.
+     *
+     * The name is the only thing on this screen that is about the box rather
+     * than about what is in it, so it is what a tap on it should change. The
+     * naming window used to hang off the PC menu, where it sat between the
+     * player and the two rows they came for; here it is out of the way and
+     * exactly where the thing it renames is written.
+     */
+    onRename: (() -> Unit)? = null,
+) {
+    // The window owns the cursor while it is open, and it owns all of it: the
+    // grid, then the rows under it. A choice the cursor could not reach was a
+    // choice only a finger could take, and a screen where some things answer
+    // to the cursor and some do not is the whole of what made the swipe
+    // controls read as arbitrary.
+    val slots = StorageLayout.BOX_CAPACITY
+    val tail = buildList<Pair<String, () -> Unit>> {
+        add("CANCEL" to onCancel)
+        if (actionLabel != null) add(actionLabel to onAction)
+        if (onRename != null) add(box.label to onRename)
+    }
+    val layer = rememberCursorLayerHandle(
+        count = slots + tail.size,
+        columns = StorageLayout.BOX_COLUMNS,
+        wraps = false,
+        grid = slots,
+    ) { index ->
+        if (index < slots) onTap(index) else tail.getOrNull(index - slots)?.second?.invoke()
+    }
+    // Once, on the way in: after that the cursor is the player's.
+    LaunchedEffect(Unit) { startSlot?.let { layer.index = it.coerceIn(0, slots - 1) } }
+    // The spot the bracket is on, and null while the cursor is on a row under
+    // the grid or has been taken by a window over this one.
+    val cursorSlot = layer.index.takeIf { layer.active && it < slots }
+    // What the head shows: the last spot stood on, so walking down to CANCEL
+    // does not empty the picture above the box.
+    var headSlot by remember { mutableIntStateOf(0) }
+    LaunchedEffect(layer.index) { if (layer.index < slots) headSlot = layer.index }
+    val onTail = layer.at.takeIf { it >= slots }?.minus(slots) ?: -1
+    // The pane beside the box follows the spot last stood on, so it keeps
+    // showing that Pokemon while the cursor is down on CANCEL.
+    LaunchedEffect(headSlot) { onHighlight(headSlot) }
+
+
+    // Folded there is one column and the box is the whole of what is on
+    // screen, so it takes the screen: the alignment setting is about which
+    // edge a window sits against when something else is sharing the screen
+    // with it, and here nothing is. Opened up it goes back to its edge and
+    // leaves the other half to the pane.
+    val unfolded = isUnfolded()
+    Box(
+        Modifier.fillMaxSize(),
+        contentAlignment =
+            if (unfolded) Gen1Layout.corner(top = true, menuSide = true)
+            else Alignment.TopCenter,
+    ) {
+        Gen1Frame(
+            modifier =
+                if (unfolded) Modifier.wrapContentWidth().padding(top = gen1Dp(5))
+                else Modifier.fillMaxSize().padding(gen1Dp(2)),
+            fillsScreen = !unfolded,
+        ) {
+            // Only where there is genuinely nothing beside the box to say it.
+            // Opened up, the pane beside it is already showing this Pokémon
+            // at full size, and the box repeating it in miniature is the
+            // same thing twice over — and the room it took is room the grid
+            // could have had.
+            //
+            // [unfolded] alone is not enough here: a Pokémon's own pages,
+            // opened over an unfolded screen, borrow this exact window's
+            // half through [LocalGen1Narrow] so it does not also try to lay
+            // out a pane of its own in that half — which reads as narrow to
+            // [isUnfolded] here too, and would otherwise bring this back on
+            // for a screen that is unfolded after all, right beside the
+            // status pages already showing the same head in full. Checking
+            // [LocalGen1Narrow] directly is what tells the two apart: a
+            // phone that is actually folded never sets it.
+            if (!unfolded && !LocalGen1Narrow.current) {
+                BoxHead(
+                    stored = box.slots.getOrNull(headSlot),
+                    sprites = sprites,
+                    spriteRevision = revision,
+                    modifier = Modifier.width(gen1Dp(HEAD_PIXELS)),
+                )
+                Spacer(Modifier.height(gen1Dp(3)))
+            }
+            // The name, with the cursor's mark before it when the cursor is
+            // on it — it is a row like any other, it just happens to sit at
+            // the top of the window rather than the bottom.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (onRename != null) {
+                    Box(Modifier.width(gen1Dp(CURSOR_MARK_PIXELS))) {
+                        if (onTail == tail.lastIndex) GbText("▶", maxLines = 1)
+                    }
+                }
+                GbText(
+                    box.label,
+                    modifier = if (onRename == null) Modifier
+                    else Modifier.gen1Clickable { onRename() },
+                    maxLines = 1,
+                )
+            }
+            GbText(
+                when {
+                    heldName != null -> "PUT $heldName WHERE?"
+                    marked.isNotEmpty() -> "${marked.size} CHOSEN"
+                    else -> "${box.contents.size}/${StorageLayout.BOX_CAPACITY}"
+                },
+                style = Gen1TextSmall,
+                maxLines = 1,
+            )
+            Spacer(Modifier.height(gen1Dp(2)))
+            Gen1BoxGrid(
+                box = box,
+                followers = followers,
+                revision = revision,
+                cursorSlot = cursorSlot,
+                onTap = { slot ->
+                    layer.index = slot
+                    onTap(slot)
+                },
+                onMove = onMove,
+                marked = marked,
+                onHold = onHold,
+                // Given the screen, it takes whatever is left after the lines
+                // above it and CANCEL below — the box is a hundred rows deep
+                // and will fill anything it is handed. Where the window wraps
+                // instead, it is told how many rows to be, because a lazy list
+                // in a column that wraps has no height to work from.
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .then(
+                        if (unfolded) Modifier.height(gen1Dp(CELL_PIXELS * visibleRows()))
+                        else Modifier.weight(1f)
+                    ),
+            )
+            Spacer(Modifier.height(gen1Dp(2)))
+            Gen1MenuRow(
+                "CANCEL",
+                selected = onTail == 0,
+                onSelect = {},
+                onConfirm = onCancel,
+            )
+        }
+        if (actionLabel != null) {
+            Box(
+                Modifier.fillMaxSize().padding(gen1Dp(4)),
+                contentAlignment = Gen1Layout.corner(top = false, menuSide = true),
+            ) {
+                Gen1BoxButton(actionLabel, onAction, selected = onTail == 1)
+            }
+        }
+    }
+}
+
+/**
+ * How many rows of the box the window shows at once, where the window is
+ * sized to its contents rather than handed the screen.
+ *
+ * Worked out from the screen rather than fixed, so the box fills a tall phone
+ * and still leaves room for the name above it and CANCEL below on a short one.
+ * In whole rows: half a row of Pokémon along the bottom edge reads as the
+ * window having been cut off.
+ *
+ * Only the opened-up layout asks, and there the block naming the Pokémon has
+ * moved out to the pane, so the only room to keep back is for those two lines.
+ */
+@Composable
+private fun visibleRows(): Int {
+    val screen = LocalConfiguration.current.screenHeightDp
+    val cell = gen1Dp(CELL_PIXELS).value
+    val forTheRest = gen1Dp(ROOM_AROUND_THE_GRID).value
+    return (((screen - forTheRest) / cell).toInt()).coerceIn(MIN_ROWS_SHOWN, StorageLayout.BOX_ROWS)
+}
+
+/** The name and count above the grid, and CANCEL below it, in game pixels. */
+private const val ROOM_AROUND_THE_GRID = 48
+private const val MIN_ROWS_SHOWN = 3
+
+/** How long each column of the box waits for the one before it. */
+private const val COLUMN_MILLIS = 26L
+
+/** A spot's side, in game pixels: the sprite with a little air around it. */
+private const val TICK_PIXELS = 4
+
+private const val CELL_PIXELS = 24
+private const val SPRITE_PIXELS = 16
+
+/** How far each arm of a cursor bracket reaches along its edges. */
+private const val BRACKET_ARM_PIXELS = 4
+
+/** The width the cursor's mark is given beside the box's name. */
+private const val CURSOR_MARK_PIXELS = 10
+
+/** The front sprite over the box, at the size the games draw one. */
+private const val HEAD_SPRITE_PIXELS = 56
+
+/**
+ * The window's width, which is the grid's: six spots across. Everything above
+ * the grid is measured to the same line so the window is one column rather
+ * than a stack of differently sized blocks.
+ */
+private const val HEAD_PIXELS = CELL_PIXELS * StorageLayout.BOX_COLUMNS
+
+/** How long a follower holds each frame while the cursor is on it. */
+private const val FRAME_MILLIS = 500L

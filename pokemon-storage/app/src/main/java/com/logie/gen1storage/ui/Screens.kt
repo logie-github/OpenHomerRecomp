@@ -1,0 +1,2277 @@
+package com.logie.gen1storage.ui
+
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import com.logie.gen1storage.download.DownloadProgress
+import com.logie.gen1storage.sprites.SpriteSet
+import com.logie.gen1storage.sprites.TrainerStore
+import com.logie.gen1storage.gen1recomp.Gen1RecompSave
+import com.logie.gen1storage.gen1recomp.SaveClassification
+import com.logie.gen1storage.pokemon.Gen1Data
+import com.logie.gen1storage.pokemon.Gen1Pokemon
+import com.logie.gen1storage.pokemon.Gen2Mail
+import com.logie.gen1storage.sound.LocalGen1Audio
+import com.logie.gen1storage.sound.SoundEffect
+import com.logie.gen1storage.storage.Provenance
+import com.logie.gen1storage.storage.StorageBox
+import com.logie.gen1storage.storage.StorageLayout
+import com.logie.gen1storage.storage.StorageRepository
+import com.logie.gen1storage.storage.StoredPokemon
+import com.logie.gen1storage.sync.LoadedSave
+import com.logie.gen1storage.sync.RemoteSave
+import com.logie.gen1storage.sync.SyncApi
+import com.logie.gen1storage.share.PrintBorder
+import com.logie.gen1storage.transfer.crossGenerationRefusal
+import com.logie.gen1storage.transfer.SaveLocation
+import com.logie.gen1storage.transfer.WithdrawTarget
+import java.time.Instant
+
+/** One party slot the deposit list can offer, and the save it belongs to. */
+/** One place in a save a Pokémon can be taken from, and what is there. */
+private data class PartyRow(
+    val key: String,
+    val location: SaveLocation,
+    /** 0 for the party, otherwise the box number — what groups the list. */
+    val area: Int,
+    val slot: Int,
+    val mon: Gen1Pokemon,
+    val save: Gen1RecompSave,
+)
+
+/** The one-line form used in every Generation I list. */
+fun pokemonRowLabel(pokemon: Gen1Pokemon): String = pokemon.displayName.uppercase()
+
+fun pokemonRowLevel(pokemon: Gen1Pokemon): String = ":L${pokemon.level}"
+
+/**
+ * The app's top level is the PC's own storage menu. Everything this app adds
+ * that the cartridge never had — access to saves, sprites, colours,
+ * diagnostics — sits behind OPTIONS.
+ */
+@Composable
+fun StorageHomeScreen(state: UiState, model: StorageViewModel) {
+    StorageSystemScreen(
+        state = state,
+        model = model,
+        onOptions = { model.open(Screen.Options) },
+    )
+}
+
+@Composable
+fun LinkScreen(state: UiState, model: StorageViewModel) {
+    ScreenColumn { item { LinkForm(state, model) } }
+}
+
+/**
+ * The two code fields and the button, without the screen around them.
+ *
+ * Its own composable because the introduction shows this for real rather than
+ * a picture of it (see `TutorialSyncScreen`), and the screen's own list put
+ * the window in something that fills the height — so inside the tour's stage
+ * the frame ran off the bottom of the space it was given and the window
+ * simply had no lower edge. A window that draws its own four sides has to be
+ * measured by its contents, wherever it is put.
+ */
+@Composable
+fun LinkForm(state: UiState, model: StorageViewModel, modifier: Modifier = Modifier) {
+    var first by remember { mutableStateOf("") }
+    var second by remember { mutableStateOf("") }
+    // Taken back if either code is edited after the question has been asked,
+    // because then it is a different pair and the answer was about the old one.
+    var declined by remember { mutableStateOf(false) }
+
+    val ready = SyncApi.normalizeCode(first) != null && SyncApi.normalizeCode(second) != null
+    val asking = ready && !declined && !state.linking
+
+    // The second field, so the first can hand the keyboard over the moment it
+    // is full. A code is exactly eight digits and there is nothing else to do
+    // in that box afterwards, so making somebody reach for the next one is
+    // asking them to do the app's work.
+    val secondField = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    // Split screen is where this screen is most used and least able to fit:
+    // the game is in the other pane with the codes on it, and this pane is
+    // half a phone tall. Everything that is not the codes and the button that
+    // takes them comes off, because with them on screen the fields themselves
+    // were pushed off the top of the pane and could not be typed into. The
+    // title is Bill's line above it, or the row that opened this.
+    val short = isShort()
+
+    // The one choice here, on the cursor: with SWIPE CONTROLS on a tap is the
+    // A button and A takes whatever the cursor is on — see [gen1Clickable] —
+    // so a button the cursor cannot reach is a button that cannot be pressed
+    // at all.
+    val at = rememberCursorLayer(1) { if (ready && !state.linking) model.link(first, second) }
+
+    Column(
+        modifier.wrapContentHeight(),
+        verticalArrangement = Arrangement.spacedBy(gen1Dp(4)),
+        horizontalAlignment = Gen1Layout.menuSide,
+    ) {
+        if (!short) {
+            Gen1Frame(Modifier.wrapContentWidth()) {
+                GbText("SAVE SYNC")
+            }
+        }
+        // These two codes are Gen1Recomp's own, read off its own screen.
+        Gen1Frame {
+            CodeField("FIRST CODE", first) { text ->
+                val wasFull = SyncApi.normalizeCode(first) != null
+                first = text
+                declined = false
+                // On the eighth digit, and only as it arrives: jumping every
+                // time a full code is touched would take the keyboard away
+                // from somebody correcting the last digit of it.
+                if (!wasFull && SyncApi.normalizeCode(text) != null) {
+                    runCatching { secondField.requestFocus() }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            CodeField(
+                "SECOND CODE",
+                second,
+                focusRequester = secondField,
+            ) { text ->
+                second = text
+                declined = false
+                // Sixteen digits in and there is nothing left to type, so the
+                // keyboard goes rather than sitting over the question.
+                if (SyncApi.normalizeCode(text) != null) keyboard?.hide()
+            }
+            Spacer(Modifier.height(12.dp))
+            // Both codes in, so the machine asks rather than waiting to be
+            // told. Asked here, in the window the codes were typed into,
+            // rather than in a window over the top of it: this screen is also
+            // shown inside the introduction, where an overlay would land on
+            // Bill mid-sentence.
+            if (asking) {
+                GbText("PROCEED WITH LINK?")
+                Spacer(Modifier.height(6.dp))
+                Gen1ChoiceRows(
+                    listOf(
+                        "YES" to { model.link(first, second) },
+                        "NO" to { declined = true },
+                    )
+                )
+            } else {
+                Gen1Button(
+                    if (state.linking) "LINKING..." else "LINK THIS DEVICE",
+                    { model.link(first, second) },
+                    enabled = ready && !state.linking && declined,
+                    selected = at == 0,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CodeField(
+    label: String,
+    value: String,
+    focusRequester: FocusRequester? = null,
+    onChange: (String) -> Unit,
+) {
+    GbText(label, style = Gen1TextSmall)
+    Spacer(Modifier.height(4.dp))
+    OutlinedTextField(
+        value = value,
+        onValueChange = { text -> onChange(text.filter { it.isDigit() || it == '-' }.take(9)) },
+        singleLine = true,
+        placeholder = { GbText("0000-0000", style = Gen1TextSmall) },
+        textStyle = Gen1Text,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        colors = TextFieldDefaults.colors(
+            focusedContainerColor = Gen1Palette.Panel,
+            unfocusedContainerColor = Gen1Palette.Panel,
+            focusedTextColor = Gen1Palette.Ink,
+            unfocusedTextColor = Gen1Palette.Ink,
+            focusedIndicatorColor = Gen1Palette.Ink,
+            unfocusedIndicatorColor = Gen1Palette.Shadow,
+            cursorColor = Gen1Palette.Ink,
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier),
+    )
+}
+
+/**
+ * The storage system itself, in the shape the games give it.
+ *
+ * There is no save browser in this app, so a save is only ever named because a
+ * transfer needs one: DEPOSIT asks which save it is taking from, WITHDRAW asks
+ * which save it is putting into. With ALL POKéMON on, every save's party is in
+ * the deposit list at once and there is nothing to ask.
+ */
+@Composable
+fun StorageSystemScreen(
+    state: UiState,
+    model: StorageViewModel,
+    onOptions: (() -> Unit)? = null,
+) {
+    // Held by the view model so a second copy of this screen — the one
+    // drawn beside a Pokémon's stats on a wide display — opens on the same
+    // face of the PC rather than back at its menu.
+    val mode = model.pcMode
+    var chosen by remember(mode) { mutableStateOf<Int?>(null) }
+    // Which rows of the open list a transfer will act on. Empty is the plain
+    // one-at-a-time PC: a tap opens the window on that Pokémon, and SELECT in
+    // that window is what turns the list into a set.
+    var marked by remember(mode) { mutableStateOf(emptySet<Int>()) }
+    // VIEW is a grid, so what is picked there is a spot in the box rather
+    // than a row in a list, and the two cannot share one number.
+    var gridSlot by remember(mode) { mutableStateOf<Int?>(null) }
+    // Picked up by MOVE and waiting for somewhere to go. A drag does the same
+    // journey in one gesture and never sets this.
+    var heldUid by remember(mode) { mutableStateOf<String?>(null) }
+    // Where the cursor is in whatever is open, for the pane beside it. Only
+    // ever read on a screen wide enough to have a pane.
+    var highlighted by remember(mode) { mutableStateOf<Int?>(null) }
+    // Cleared after a transfer, so the ticks do not outlive what they pointed
+    // at — every index shifts the moment something leaves a list.
+    //
+    // The list itself closes here too, and only here: the count is raised in
+    // the same breath as the result is said, which is after the ball has
+    // finished. So the order the player sees is the animation, then what it
+    // did, then the PC's own menu waiting underneath — rather than the menu
+    // reappearing behind a Pokémon still on its way out.
+    //
+    // Keyed on the count having actually moved rather than on the count
+    // itself: a LaunchedEffect runs when it enters composition as well as
+    // when its key changes, and this screen enters composition every time it
+    // is returned to. So arriving at the PC with something already underway —
+    // DEPOSIT having just been sent to the shelf for a card, and come back
+    // with one — landed on the menu with the list closed before it ever drew.
+    var settled by remember { mutableStateOf(state.transfers) }
+    LaunchedEffect(state.transfers) {
+        if (state.transfers == settled) return@LaunchedEffect
+        settled = state.transfers
+        marked = emptySet()
+        chosen = null
+        gridSlot = null
+        model.pcMode = PcMode.MENU
+    }
+    fun toggle(index: Int) {
+        marked = if (index in marked) marked - index else marked + index
+    }
+
+    // Standing on the PC's own menu rather than in something opened from it.
+    val atMenu = mode == PcMode.MENU
+    val box = state.storage.boxes.firstOrNull()
+    val thisBoxLabel = box?.label ?: "THE PC"
+    val boxContents = box?.contents.orEmpty()
+    // WITHDRAW offers everything the app holds; VIEW is about the box that is
+    // open, because that is the one being rearranged.
+    val stored = if (mode == PcMode.WITHDRAW) {
+        state.storage.boxes.flatMap { it.contents }
+    } else {
+        boxContents
+    }
+
+    // ALL POKéMON puts every save in the lists at once, so there is nothing
+    // to choose; otherwise the PC works with one cartridge at a time.
+    val needsCart = !state.showAllSaves && state.save(state.activeSaveKey) == null
+    var refusal by remember(mode) { mutableStateOf<String?>(null) }
+
+
+    // A save's boxes, and only its boxes. A transfer never touches a party:
+    // the party is what the player is actually carrying, the games guard it
+    // with the last-Pokémon rule, and there is nothing here worth the risk of
+    // reaching into it.
+    val depositRows = buildList {
+        val keys = if (state.showAllSaves) state.saves.map { it.key } else listOfNotNull(state.activeSaveKey)
+        keys.forEach { key ->
+            val save = state.save(key)?.save ?: return@forEach
+            save.boxes.forEachIndexed { boxIndex, box ->
+                box.forEachIndexed { index, mon ->
+                    add(PartyRow(key, SaveLocation.Box(boxIndex + 1, index + 1), boxIndex + 1, index, mon, save))
+                }
+            }
+        }
+    }
+
+
+    /** The label a group starts under, or null once that group is open. */
+    fun depositHeader(index: Int): String? {
+        val row = depositRows[index]
+        val previous = depositRows.getOrNull(index - 1)
+        if (previous != null && previous.key == row.key && previous.area == row.area) return null
+        val where = "BOX ${row.area}"
+        return if (state.showAllSaves) "${row.save.trainerName.uppercase()} $where" else where
+    }
+
+    // An empty list has nothing to draw a window around, so it speaks through
+    // the message window instead — which is what the cartridge does.
+    // VIEW draws the box either way, so an empty one speaks for itself: a
+    // grid of empty spots is already the answer the message would give.
+    val emptiness = when (mode) {
+        PcMode.WITHDRAW -> "What? There are no POKéMON here!".takeIf { stored.isEmpty() }
+        // Named rather than left as the cartridge's bare "here": the list
+        // reads the card in the machine and nothing else, so an empty one
+        // over a shelf of cards that plainly have Pokémon on them has to say
+        // which card it is talking about. Changing that card is the TRAINER
+        // CARD row's job, and DEPOSIT no longer does it for you.
+        PcMode.DEPOSIT -> "There are no POKéMON in this card's BOXES."
+            .takeIf { depositRows.isEmpty() }
+        else -> null
+    }
+
+    /**
+     * The status screen for a stored Pokémon, found by uid.
+     *
+     * WITHDRAW lists every box at once, so the row's position in the list is
+     * not its slot in the open box — looking one up by where it actually lives
+     * is the only reading that holds for both lists.
+     */
+    fun statusOf(uid: String, transfer: StatusTransfer?): Screen.Status? {
+        val boxIndex = state.storage.find(uid)?.first ?: return null
+        val slot = state.storage.boxes.getOrNull(boxIndex - 1)
+            ?.contents?.indexOfFirst { it.uid == uid }
+            ?.takeIf { it >= 0 } ?: return null
+        return Screen.Status(null, boxIndex, slot, transfer)
+    }
+
+    /**
+     * "SEND PIKACHU TO RED?" — the one question a transfer asks.
+     *
+     * Nothing moves and nothing is written until it is answered, so the ball
+     * going up is the player's own doing rather than the first they hear of
+     * it. Where it is going was never in question; whether to send it is.
+     */
+    fun confirmSend(
+        what: String,
+        where: String,
+        speciesId: String?,
+        gameVersionId: String?,
+        motion: TransferMotion,
+        alsoSpeciesIds: List<String?> = emptyList(),
+        send: () -> Unit,
+    ) {
+        model.askToSend(
+            TransferScene(
+                speciesId = speciesId,
+                gameVersionId = gameVersionId,
+                name = what,
+                destination = where,
+                alsoSpeciesIds = alsoSpeciesIds,
+                motion = motion,
+            ),
+            "${motion.verb} $what TO $where?",
+            send,
+        )
+    }
+
+    /**
+     * Takes them out, the way the cartridge does: no question about where.
+     *
+     * A withdrawal goes to the box the save has open, exactly as a deposit
+     * goes to the box this PC has open. The cartridge is only asked for when
+     * there is not one in the machine at all.
+     */
+    fun startWithdraw(uids: List<String>) {
+        chosen = null
+        val active = state.activeSaveKey
+        val loaded = state.save(active)?.save
+        if (active == null || loaded == null) {
+            model.open(Screen.ChooseCart(null, uids))
+            return
+        }
+        // Asked here rather than on arrival. The engine refuses a Pokémon
+        // that belongs to the other generation at the point of writing, which
+        // it has to — but by then the question has been put, the ball has
+        // gone up and the whole trade has played out, and the answer lands as
+        // if something went wrong mid-flight. Nothing is animated that was
+        // never going anywhere.
+        val generation = state.remote(active)?.version?.generation
+            ?: if (loaded.isGen2) 2 else 1
+        val blocked = uids.firstNotNullOfOrNull { uid ->
+            state.storage.find(uid)?.second?.let { crossGenerationRefusal(it, generation) }
+        }
+        if (blocked != null) {
+            refusal = blocked
+            return
+        }
+        // The first one stands for the set when there are several; there is
+        // one sprite's worth of room and it is better than none.
+        val first = uids.firstOrNull()?.let { state.storage.find(it)?.second }
+        val what = if (uids.size == 1) first?.pokemon?.displayName?.uppercase() ?: "IT"
+        else "${uids.size} POKéMON"
+        confirmSend(
+            what = what,
+            where = loaded.trainerName.uppercase(),
+            speciesId = first?.pokemon?.speciesId,
+            gameVersionId = first?.spriteGameVersionId,
+            motion = TransferMotion.OUT,
+            alsoSpeciesIds = uids.drop(1).mapNotNull {
+                state.storage.find(it)?.second?.pokemon?.speciesId
+            },
+        ) {
+            model.withdrawToSave(uids, active, WithdrawTarget.Box(loaded.currentBox))
+        }
+    }
+
+    // The list and the window that opens on a chosen Pokémon are separate
+    // layers on the screen, so they are built as separate slots here rather
+    // than nested — the message window belongs between them.
+    val pick: PartyRow? = chosen?.takeIf { mode == PcMode.DEPOSIT }?.let { depositRows.getOrNull(it) }
+    val storedPick = when (mode) {
+        PcMode.WITHDRAW -> chosen?.let { stored.getOrNull(it) }
+        // The grid's window opens on the second tap, so it follows `chosen`
+        // while the cursor on the grid itself stays on `gridSlot`.
+        PcMode.VIEW -> chosen?.let { box?.slots?.getOrNull(it) }
+        else -> null
+    }
+
+    StorageSystemScreen(
+        outLabel = state.outLabel,
+        inLabel = state.inLabel,
+        // The caption belongs to the menu and goes when the menu does: a list
+        // open over it, a question in the middle of the screen, or a message
+        // come up at the foot of it.
+        notice = refusal ?: emptiness,
+        // Tapping it puts it away. A refusal goes back to the menu it was
+        // refused from; an empty list closes, which is the same thing the
+        // hold does and the thing a player reaches for first.
+        onNotice = {
+            if (refusal != null) refusal = null else model.pcMode = PcMode.MENU
+        },
+        // The caption is the machine idling, and it is not idling while it
+        // has a question open: the prompt window comes up in the same corner
+        // and grows towards this one, so a tall one — a transfer landing and
+        // then asking whether to open the game — sat on top of it.
+        showCaption = atMenu && refusal == null && emptiness == null && state.prompt == null,
+        // Whatever is open has the screen to itself.
+        showMenu = atMenu,
+        // A transfer needs a cartridge in the machine, and the row is not
+        // offered without one — so this is the check behind it rather than the
+        // whole of the reason it exists. `BillsPCDeposit` in pokered guards
+        // the same way: before the list opens, not after.
+        hasCard = !needsCart,
+        onDeposit = {
+            refusal = null
+            when {
+                needsCart ->
+                    model.open(
+                        Screen.ChooseCart(null, thenOpenStorage = true, then = PcMode.DEPOSIT)
+                    )
+
+                (box?.freeSlots ?: 0) <= 0 -> refusal = "Oops! This Box is full of POKéMON."
+                // Otherwise the list, always, for the card that is in the
+                // machine. DEPOSIT used to hand the player back to the shelf
+                // when that card had nothing boxed and another one did — or,
+                // where only one other did, quietly swap the card for them.
+                // Both were the same mistake: a row that answers "deposit"
+                // with "pick a different cartridge" sends somebody who has
+                // already chosen theirs round the houses, and swapping it
+                // without asking changes what every other screen is about.
+                // An empty list says so and leaves the choice where it
+                // belongs, on the TRAINER CARD row.
+                else -> model.pcMode = PcMode.DEPOSIT
+            }
+        },
+        onView = { model.pcMode = PcMode.VIEW },
+        onChangeCart = { model.open(Screen.ChooseCart(null)) },
+        onTrade = if (state.tradeEvolution) ({ model.open(Screen.Trade) }) else null,
+        // Offered as soon as the PC holds anything, rather than only when
+        // something can actually go. The screen behind it lists everything in
+        // the box and says of each one whether it can go on and why not — so
+        // a player whose Pokemon are all being held back can now reach the
+        // answer, which under the old rule was the one case where the row
+        // disappeared and took the explanation with it.
+        onTimeCapsule =
+            if (state.storage.total > 0) {
+                { model.open(Screen.TimeCapsule) }
+            } else null,
+        onDex = { model.open(Screen.Dex) },
+        onOptions = onOptions,
+        caption = when {
+            !state.linked -> "Link this device in OPTIONS."
+            needsCart -> "No trainer card inserted."
+            else -> "What?"
+        },
+        overlay = if (emptiness != null) null else when (mode) {
+            PcMode.MENU -> null
+
+            PcMode.VIEW -> ({
+                val open = box ?: state.storage.boxes.firstOrNull()
+                if (open != null) {
+                    val held = heldUid?.let { uid ->
+                        state.storage.find(uid)?.second?.pokemon?.displayName?.uppercase()
+                    }
+                    BoxGridOverlay(
+                        box = open,
+                        followers = model.followers,
+                        sprites = model.sprites,
+                        revision = state.spriteRevision,
+                        heldName = held,
+                        startSlot = gridSlot,
+                        // Tapping a Pokémon opens what can be done with it.
+                        // It used to open its stats and want a second tap for
+                        // the list, which left the one thing a player came to
+                        // the box to do — send it to a cartridge — two taps
+                        // and a screen away, with nothing on the stats screen
+                        // saying it was there. Stats are the first row of the
+                        // list instead, so the first tap answers both.
+                        onTap = { slot ->
+                            val carrying = heldUid
+                            val here = open.slots.getOrNull(slot)
+                            when {
+                                carrying != null -> {
+                                    model.moveStoredToSlot(carrying, open.index, slot)
+                                    heldUid = null
+                                    gridSlot = null
+                                }
+                                here == null -> gridSlot = null
+                                else -> {
+                                    gridSlot = slot
+                                    chosen = slot
+                                }
+                            }
+                        },
+                        onMove = { from, to ->
+                            open.slots.getOrNull(from)?.let {
+                                model.moveStoredToSlot(it.uid, open.index, to)
+                            }
+                            gridSlot = null
+                        },
+                        onCancel = {
+                            when {
+                                heldUid != null -> heldUid = null
+                                marked.isNotEmpty() -> marked = emptySet()
+                                else -> model.pcMode = PcMode.MENU
+                            }
+                        },
+                        onHighlight = { highlighted = it },
+                        marked = marked,
+                        // Hold one to pick it up, hold another to put it down
+                        // — the same swap a drag does, for two Pokémon a long
+                        // way apart in a box a hundred rows deep.
+                        onHold = { slot ->
+                            val carrying = heldUid
+                            val here = open.slots.getOrNull(slot)
+                            when {
+                                // Putting down what is being carried, wherever
+                                // that is — an empty spot or on top of another,
+                                // which swaps them.
+                                carrying != null -> {
+                                    model.moveStoredToSlot(carrying, open.index, slot)
+                                    heldUid = null
+                                    gridSlot = null
+                                }
+                                // Once a selection is going, a hold adds to it
+                                // rather than starting a move: the gesture
+                                // follows what the screen is in the middle of.
+                                marked.isNotEmpty() -> if (here != null) toggle(slot)
+                                here != null -> {
+                                    heldUid = here.uid
+                                    gridSlot = slot
+                                    chosen = null
+                                }
+                            }
+                        },
+                        actionLabel = TRANSFER_LABEL.takeIf {
+                            marked.isNotEmpty() && state.saves.isNotEmpty()
+                        },
+                        onAction = {
+                            val uids = marked.sorted()
+                                .mapNotNull { open.slots.getOrNull(it)?.uid }
+                            marked = emptySet()
+                            startWithdraw(uids)
+                        },
+                        // A tap on the box's name names it. It is the one
+                        // thing on the screen that is about the box itself,
+                        // and naming boxes had no way in at all since the
+                        // window that used to carry it came off the menu.
+                        onRename = { model.prompt(Prompt.RenameBox(open.index)) },
+                    )
+                }
+            })
+
+            PcMode.WITHDRAW -> ({
+                MonListOverlay(
+                    entries = stored.map {
+                        MonRow(pokemonRowLabel(it.pokemon), pokemonRowLevel(it.pokemon))
+                    },
+                    onConfirm = { chosen = it },
+                    onCancel = { model.pcMode = PcMode.MENU },
+                    emptyMessage = "What? There are no POKéMON here!",
+                    marked = marked,
+                    onToggle = ::toggle,
+                    actionLabel = TRANSFER_LABEL.takeIf {
+                        mode == PcMode.WITHDRAW && marked.isNotEmpty() && state.saves.isNotEmpty()
+                    },
+                    onAction = { startWithdraw(marked.mapNotNull { stored.getOrNull(it)?.uid }) },
+                    onHighlight = { highlighted = it },
+                )
+            })
+
+            PcMode.DEPOSIT -> ({
+                MonListOverlay(
+                    entries = depositRows.mapIndexed { index, row ->
+                        MonRow(
+                            pokemonRowLabel(row.mon),
+                            pokemonRowLevel(row.mon),
+                            header = depositHeader(index),
+                        )
+                    },
+                    onConfirm = { chosen = it },
+                    onCancel = { model.pcMode = PcMode.MENU },
+                    emptyMessage = "There are no POKéMON in this card's BOXES.",
+                    marked = marked,
+                    onToggle = ::toggle,
+                    actionLabel = TRANSFER_LABEL.takeIf { marked.isNotEmpty() },
+                    onAction = {
+                        val picks = marked.mapNotNull { index ->
+                            depositRows.getOrNull(index)?.let { it.key to it.location }
+                        }
+                        chosen = null
+                        val lead = marked.minOrNull()?.let { depositRows.getOrNull(it) }
+                        val rest = marked.sorted().drop(1)
+                            .mapNotNull { depositRows.getOrNull(it)?.mon?.speciesId }
+                        confirmSend(
+                            what = "${picks.size} POKéMON",
+                            where = thisBoxLabel,
+                            speciesId = lead?.mon?.speciesId,
+                            gameVersionId = state.remote(lead?.key)?.version?.id,
+                            motion = TransferMotion.IN,
+                            alsoSpeciesIds = rest,
+                        ) {
+                            model.depositFromSave(picks, StorageLayout.THE_BOX)
+                        }
+                    },
+                    onHighlight = { highlighted = it },
+                )
+            })
+        },
+        // The spare half of an opened screen, showing whatever the cursor is
+        // on: the same pages the status screen draws, so walking a list reads
+        // a Pokémon as it goes rather than after it stops. A folded phone has
+        // no spare half and never sees this.
+        preview = previewOf(mode, highlighted, box, stored, depositRows, state, model),
+        action = when {
+            mode == PcMode.WITHDRAW && storedPick != null -> ({
+                MonActionOverlay(
+                    actions = listOf(
+                        // Always asks which save it is going to, and then
+                        // where inside it — a withdrawal leaves the app, and
+                        // that is not something to infer from what happens to
+                        // be loaded.
+                        MonAction(
+                            state.outLabel,
+                            { startWithdraw(listOf(storedPick.uid)) },
+                            enabled = state.saves.isNotEmpty(),
+                        ),
+                        MonAction("STATS", {
+                            statusOf(storedPick.uid, StatusTransfer.WITHDRAW)?.let(model::open)
+                        }),
+                        // Ticks this one and hands the list back. From here a
+                        // tap on any row ticks it too, so several go in one
+                        // trip without a mode to switch into first.
+                        MonAction("SELECT", {
+                            chosen?.let { toggle(it) }
+                            chosen = null
+                        }),
+                    ),
+                    onCancel = { chosen = null },
+                    note = if (state.saves.isEmpty()) "NO SAVES ON THE ACCOUNT" else null,
+                )
+            })
+
+            mode == PcMode.VIEW && storedPick != null -> ({
+                val name = storedPick.pokemon.displayName.uppercase()
+                MonActionOverlay(
+                    actions = listOf(
+                        // Sending it to a cartridge starts here: the box is
+                        // where a Pokémon is picked, so it is where the choice
+                        // to send it belongs. With no card in the machine this
+                        // asks which one rather than not being offered — there
+                        // is always somewhere for it to go, and a row that is
+                        // missing looks like a thing the app cannot do.
+                        MonAction(TRANSFER_LABEL, {
+                            startWithdraw(listOf(storedPick.uid))
+                            gridSlot = null
+                        }),
+                        MonAction("STATS", {
+                            chosen = null
+                            statusOf(storedPick.uid, null)?.let(model::open)
+                        }),
+                        // Picks it up. From here a tap on any spot puts it
+                        // down, and the box arrows still work, so moving one
+                        // to another box is the same gesture as moving it two
+                        // spots left.
+                        MonAction("MOVE", {
+                            heldUid = storedPick.uid
+                            chosen = null
+                            gridSlot = null
+                        }),
+                        MonAction("RELEASE", {
+                            model.prompt(
+                                Prompt.Confirm(
+                                    lines = listOf(
+                                        "Once released, $name is",
+                                        "gone forever. Ok?",
+                                    ),
+                                    confirmLabel = "YES",
+                                    cancelLabel = "NO",
+                                    onConfirm = {
+                                        model.releaseStored(storedPick.uid)
+                                        chosen = null
+                                        gridSlot = null
+                                    },
+                                )
+                            )
+                        }),
+                    ),
+                    // Both cleared, so the next tap on that Pokémon opens this
+                    // list again rather than something else.
+                    onCancel = { chosen = null; gridSlot = null },
+                    cancelLabel = BACK_LABEL,
+                )
+            })
+
+            mode == PcMode.DEPOSIT && pick != null -> ({
+                // The games never let the last one go, and neither does this —
+                // counted per save, not per list.
+                MonActionOverlay(
+                    actions = listOf(
+                        MonAction(
+                            state.inLabel,
+                            {
+                                chosen = null
+                                confirmSend(
+                                    what = pick.mon.displayName.uppercase(),
+                                    where = thisBoxLabel,
+                                    speciesId = pick.mon.speciesId,
+                                    gameVersionId = state.remote(pick.key)?.version?.id,
+                                    motion = TransferMotion.IN,
+                                ) {
+                                    model.depositFromSave(
+                                        pick.key,
+                                        pick.location,
+                                        StorageLayout.THE_BOX,
+                                    )
+                                }
+                            },
+                        ),
+                        MonAction("STATS", {
+                            model.open(
+                                Screen.Status(pick.key, pick.area, pick.slot, StatusTransfer.DEPOSIT)
+                            )
+                        }),
+                        MonAction("SELECT", {
+                            chosen?.let { toggle(it) }
+                            chosen = null
+                        }),
+                    ),
+                    onCancel = { chosen = null },
+                )
+            })
+
+            else -> null
+        },
+    )
+}
+
+/**
+ * The pane beside an open list: the Pokémon the cursor is on, drawn as the
+ * status screen draws one.
+ *
+ * Null wherever there is nothing to look at — on the menu, on an empty spot,
+ * on CANCEL — so the half simply stays empty rather than holding the last
+ * thing that happened to be under the cursor.
+ *
+ * It is the status screen itself rather than a summary of it, so the pages
+ * are the pages: stats, and moves behind a tap. It says nothing out loud,
+ * because a cry per step of the cursor is thirty cries across a box.
+ */
+@Composable
+private fun previewOf(
+    mode: PcMode,
+    highlighted: Int?,
+    box: StorageBox?,
+    stored: List<StoredPokemon>,
+    depositRows: List<PartyRow>,
+    state: UiState,
+    model: StorageViewModel,
+): (@Composable () -> Unit)? {
+    // Nothing to preview while a Pokémon's own pages are open over this
+    // screen. The status screen keeps to one half and leaves this one live in
+    // the other, and what this one then put in that other half was the same
+    // Pokémon's pages again — the same sprite, the same number, the same
+    // name, twice on one screen. The full pages are the preview by then.
+    if (state.screen is Screen.Status) return null
+    val index = highlighted ?: return null
+    val pokemon: Gen1Pokemon?
+    val gameVersionId: String?
+    // Set only for one this app is holding; a Pokémon still in a save came
+    // from the save it is in and has nothing to say about it.
+    var held: Provenance? = null
+    when (mode) {
+        PcMode.VIEW -> {
+            val here = box?.slots?.getOrNull(index)
+            pokemon = here?.pokemon
+            gameVersionId = here?.spriteGameVersionId
+            held = here?.provenance
+        }
+        PcMode.WITHDRAW -> {
+            val here = stored.getOrNull(index)
+            pokemon = here?.pokemon
+            gameVersionId = here?.spriteGameVersionId
+            held = here?.provenance
+        }
+        PcMode.DEPOSIT -> {
+            val here = depositRows.getOrNull(index)
+            pokemon = here?.mon
+            gameVersionId = state.remote(here?.key)?.version?.id
+        }
+        PcMode.MENU -> return null
+    }
+    val shown = pokemon ?: return null
+    return {
+        Gen1StatusScreen(
+            pokemon = shown,
+            gameVersionId = gameVersionId,
+            store = model.sprites,
+            spriteRevision = state.spriteRevision,
+            inPane = true,
+            speaks = false,
+            provenance = held,
+        )
+    }
+}
+
+/**
+ * The button under a list that acts on everything ticked in it.
+ *
+ * One word, and the same word both ways: which direction it is going is
+ * already settled by the row that opened the list, and the ticks say how many.
+ */
+private const val TRANSFER_LABEL = "TRANSFER"
+
+/** Which of the PC's faces is showing. Held by the view model: see [StorageViewModel.pcMode]. */
+enum class PcMode { MENU, WITHDRAW, DEPOSIT, VIEW }
+
+/** The full status screen for one Pokémon, wherever it lives. */
+@Composable
+fun StatusScreen(
+    state: UiState,
+    model: StorageViewModel,
+    key: String?,
+    area: Int,
+    slot: Int,
+    transfer: StatusTransfer? = null,
+) {
+    val pokemon = if (key == null) {
+        state.storage.boxes.getOrNull(area - 1)?.contents?.getOrNull(slot)?.pokemon
+    } else {
+        val save = state.save(key)?.save
+        if (area == 0) save?.party?.getOrNull(slot)
+        else save?.boxes?.getOrNull(area - 1)?.getOrNull(slot)
+    }
+    if (pokemon == null) {
+        ScreenColumn { item { Gen1Frame { GbText("THAT POKéMON IS NO LONGER THERE.") } } }
+        return
+    }
+    // A stored Pokémon is shown in the art of the game it was deposited from.
+    val gameVersionId = if (key == null) {
+        state.storage.boxes.getOrNull(area - 1)?.contents?.getOrNull(slot)?.spriteGameVersionId
+    } else {
+        state.remote(key)?.version?.id
+    }
+    // How many there are to walk through where this one lives, so the ends of
+    // the box are ends rather than somewhere that looks the same but does
+    // nothing.
+    val siblings = if (key == null) {
+        state.storage.boxes.getOrNull(area - 1)?.contents?.size ?: 0
+    } else {
+        val save = state.save(key)?.save
+        if (area == 0) save?.party?.size ?: 0
+        else save?.boxes?.getOrNull(area - 1)?.size ?: 0
+    }
+
+    // Every way off this screen, in the order a swipe walks them, and only the
+    // ones that are actually there: at the first of a box there is no PREV, and
+    // the cursor should not have to step over a word that does nothing. The
+    // buttons then look their position up rather than counting for themselves,
+    // so the arrow is always on the one a tap would take.
+    val transferPair = transferAction(state, model, key, area, slot, transfer, pokemon)
+    // Only for one this app is holding. A Pokémon still in a save is the
+    // cartridge's to name, and the card is about where a Pokémon came from,
+    // which a Pokémon that has not left anywhere cannot say.
+    val storedUid = if (key == null) {
+        state.storage.boxes.getOrNull(area - 1)?.contents?.getOrNull(slot)?.uid
+    } else null
+    // The two things the PC can do to a Pokémon that are not about moving it.
+    // Both used to be written and reachable from nowhere.
+    val cardActions = buildList<Pair<String, () -> Unit>> {
+        if (storedUid != null) {
+            add(NICKNAME_LABEL to { model.prompt(Prompt.RenameMon(storedUid)) })
+            // Into the printer rather than straight out: there is more than
+            // one page it could print, and which one is the player's to say.
+            add(SHARE_LABEL to { model.open(Screen.Printer(storedUid)) })
+        }
+        // A live save's own party — key means the game, area 0 the party —
+        // and only while it is actually carrying a letter. `MonMailAction`'s
+        // own row, `mon_menu.asm`'s MAIL.
+        if (key != null && area == 0 && pokemon.holdsMail) {
+            // The screen's own slot is 0-based; sPartyMail and everything
+            // that reads it (Gen2Mail, MailEngine) count from one.
+            add("MAIL" to { model.prompt(Prompt.MailAction(key, slot + 1)) })
+        }
+    }
+    // What this screen can be told to do, and only that. Walking to the one
+    // beside this and leaving are both gestures now — a swipe left or right
+    // for the neighbour, a hold to go back — so they are not rows taking up a
+    // menu that is otherwise two lines long. The page turn moved with them.
+    val actions = buildList<Pair<String, () -> Unit>> {
+        transferPair?.let(::add)
+        addAll(cardActions)
+    }
+    // Up and down walk the actions; left and right turn the pages, which is
+    // how the cartridge turns them and the only place on this screen a
+    // sideways swipe has anything to do.
+    var page by remember(pokemon.fingerprint) { mutableIntStateOf(0) }
+    // How many there are to turn: an egg has one screen, a Generation II
+    // Pokémon has the cartridge's three plus this app's dex page, and a
+    // Generation I one has three.
+    val pages = when {
+        pokemon.isEgg -> 1
+        pokemon.generation >= 2 -> GEN2_PAGES
+        else -> PAGES
+    }
+    fun goTo(next: Int) {
+        if (next in 0 until siblings) model.replace(Screen.Status(key, area, next, transfer))
+    }
+    val at = rememberCursorLayer(
+        actions.size.coerceAtLeast(1),
+        onSide = { _, button ->
+            goTo(slot + if (button == GbButton.RIGHT) 1 else -1)
+            true
+        },
+    ) { index -> actions.getOrNull(index)?.second?.invoke() }
+    fun isOn(label: String) = actions.getOrNull(at)?.first == label
+
+    Gen1StatusScreen(
+        pokemon = pokemon,
+        gameVersionId = gameVersionId,
+        store = model.sprites,
+        spriteRevision = state.spriteRevision,
+        page = page,
+        onPage = { page = it },
+        // Only for one this app is holding: a Pokémon still in a save came
+        // from the save it is in.
+        provenance = if (key == null) {
+            state.storage.boxes.getOrNull(area - 1)?.contents?.getOrNull(slot)?.provenance
+        } else null,
+        onSpriteLongPress = { species -> model.prompt(Prompt.ChooseSpriteSet(species)) },
+        // Swiped through rather than stepped through with a row at each end.
+        // A Pokemon either side of this one is a neighbour, and reaching a
+        // neighbour by pressing a word called NEXT is the long way round.
+        onNeighbour = { forward -> goTo(slot + if (forward) 1 else -1) },
+        footer = {
+            // One menu, in the window every other menu in this app is in,
+            // rather than a row of buttons along the bottom. There is nothing
+            // on this screen that a menu could not hold, and a screen of
+            // buttons beside a screen of menus is two apps.
+            if (actions.isNotEmpty()) {
+                Gen1Frame(Modifier.wrapContentWidth()) {
+                    actions.forEach { (label, act) ->
+                        Gen1MenuRow(
+                            label,
+                            selected = isOn(label),
+                            onSelect = {},
+                            onConfirm = act,
+                        )
+                    }
+                }
+            }
+        },
+    )
+}
+
+/** Opens the game at a save, or says it could not. */
+private fun openTheGame(
+    context: android.content.Context,
+    model: StorageViewModel,
+    cartridge: Prompt.Cartridge,
+    slot: String?,
+) {
+    val opened = TheGame.open(context, cartridge.versionId, slot, cartridge.playthroughId)
+    if (!opened) model.prompt(Prompt.Message(listOf("THE GAME WOULD NOT OPEN.")))
+}
+
+/**
+ * The question under a transfer's result: which cartridge to go and sync.
+ *
+ * Named by the trainer rather than by the game, because the game is not what
+ * a player is picking between — an account can hold three playthroughs of RED
+ * and the one they mean is the one whose card is in the machine.
+ */
+private fun syncLines(cartridge: Prompt.Cartridge?): List<String> = when {
+    cartridge == null -> emptyList()
+    cartridge.trainerName.isNullOrBlank() -> listOf("SYNC ${cartridge.label}?")
+    else -> listOf(
+        "SYNC ${cartridge.label} WITH",
+        "${cartridge.trainerName}'S TRAINER CARD?",
+    )
+}
+
+internal const val BACK_LABEL = "BACK"
+private const val NICKNAME_LABEL = "NAME"
+private const val SHARE_LABEL = "SHARE"
+
+/**
+ * The transfer this status screen was opened from, if it was opened from one,
+ * as a label and the thing pressing it does.
+ *
+ * Not a composable: the same action has to be both a button and a row on the
+ * cursor, and handing back what it does lets the one description serve both.
+ */
+private fun transferAction(
+    state: UiState,
+    model: StorageViewModel,
+    key: String?,
+    area: Int,
+    slot: Int,
+    transfer: StatusTransfer?,
+    pokemon: Gen1Pokemon,
+): Pair<String, () -> Unit>? = when (transfer) {
+    StatusTransfer.WITHDRAW -> {
+        val uid = if (key == null) {
+            state.storage.boxes.getOrNull(area - 1)?.contents?.getOrNull(slot)?.uid
+        } else null
+        if (uid == null) null else state.outLabel to {
+            model.back()
+            val active = state.activeSaveKey
+            val loaded = state.save(active)?.save
+            if (active != null && loaded != null) {
+                model.askToSend(
+                    TransferScene(
+                        speciesId = pokemon.speciesId,
+                        gameVersionId = null,
+                        name = pokemon.displayName.uppercase(),
+                        destination = loaded.trainerName.uppercase(),
+                        motion = TransferMotion.OUT,
+                    ),
+                    "${TransferMotion.OUT.verb} " +
+                        "${pokemon.displayName.uppercase()} TO " +
+                        "${loaded.trainerName.uppercase()}?",
+                ) {
+                    model.withdrawToSave(
+                        listOf(uid),
+                        active,
+                        WithdrawTarget.Box(loaded.currentBox),
+                    )
+                }
+            } else {
+                model.open(Screen.ChooseCart(null, listOf(uid)))
+            }
+        }
+    }
+
+    StatusTransfer.DEPOSIT -> {
+        if (key == null || area <= 0) null else state.inLabel to {
+            model.back()
+            val where = state.storage.boxes.firstOrNull()?.label ?: "THE PC"
+            model.askToSend(
+                TransferScene(
+                    speciesId = pokemon.speciesId,
+                    gameVersionId = state.remote(key)?.version?.id,
+                    name = pokemon.displayName.uppercase(),
+                    destination = where,
+                    motion = TransferMotion.IN,
+                ),
+                "${TransferMotion.IN.verb} " +
+                    "${pokemon.displayName.uppercase()} TO $where?",
+            ) {
+                model.depositFromSave(
+                    key,
+                    SaveLocation.Box(area, slot + 1),
+                    StorageLayout.THE_BOX,
+                )
+            }
+        }
+    }
+
+    null -> null
+}
+
+
+
+/**
+ * Everything the cartridge's PC menu does not have, sorted into its own
+ * drawers.
+ *
+ * It had grown into one column of seven windows, each with its own buttons
+ * and its own explaining, which is a lot of screen for a handful of switches.
+ * The switches have not changed; only where they live has. Folded, a drawer
+ * replaces this list rather than opening over it, so there is only ever one
+ * menu on screen; opened up, the list keeps its half and the drawer takes
+ * the other.
+ */
+@Composable
+fun OptionsScreen(state: UiState, model: StorageViewModel, onShareReport: () -> Unit) {
+    var drawer by remember { mutableStateOf<OptionsDrawer?>(null) }
+    // Back closes the drawer before it leaves OPTIONS. Without this the
+    // drawer is a screen the back stack has never heard of, and one press
+    // walked straight out of the settings the player was in the middle of.
+    androidx.activity.compose.BackHandler(enabled = drawer != null) { drawer = null }
+
+    if (drawer != null && !isUnfolded()) {
+        OptionsDrawerContent(drawer!!, state, model, onShareReport, { drawer = it }) { drawer = null }
+        return
+    }
+
+    if (isUnfolded()) {
+        Row(Modifier.fillMaxSize()) {
+            // The list keeps the edge the menus use; the drawer opens into
+            // the space beside it rather than over the top of it.
+            if (!Gen1Layout.windowsOnRight) {
+                Box(Modifier.weight(1f)) { OptionsList(state, model) { drawer = it } }
+                Box(Modifier.weight(1f)) {
+                    drawer?.let { open ->
+                        OptionsDrawerContent(
+                            open, state, model, onShareReport,
+                            onOpen = { drawer = it },
+                            onBack = { drawer = null },
+                        )
+                    }
+                }
+            } else {
+                Box(Modifier.weight(1f)) {
+                    drawer?.let { open ->
+                        OptionsDrawerContent(
+                            open, state, model, onShareReport,
+                            onOpen = { drawer = it },
+                            onBack = { drawer = null },
+                        )
+                    }
+                }
+                Box(Modifier.weight(1f)) { OptionsList(state, model) { drawer = it } }
+            }
+        }
+        return
+    }
+
+    OptionsList(state, model) { drawer = it }
+}
+
+/**
+ * How tall a drawer's rows may get before they scroll.
+ *
+ * Measured off the screen rather than fixed: enough of it that a short drawer
+ * never scrolls at all, and little enough that the longest one still shows
+ * the heading above it and leaves the ground visible underneath.
+ */
+@Composable
+private fun drawerRowsHeight(): androidx.compose.ui.unit.Dp {
+    val screen = LocalConfiguration.current.screenHeightDp
+    return (screen * 0.68f).dp
+}
+
+/** The drawers, in the order they are offered. */
+enum class OptionsDrawer(val label: String) {
+    VISUAL("VISUAL"),
+    PALETTES("PALETTES"),
+    AUDIO("AUDIO"),
+    MOTION("ACCESSIBILITY"),
+    LAYOUT("LAYOUT"),
+    DOWNLOADS("DOWNLOADS"),
+    ROMS("ROMS"),
+    SAVES("SAVE SYNC"),
+    MODS("MODS"),
+    ABOUT("ABOUT"),
+}
+
+@Composable
+private fun OptionsList(
+    state: UiState,
+    model: StorageViewModel,
+    onOpen: (OptionsDrawer) -> Unit,
+) {
+    // PALETTES is not here: it opens from VISUAL, which is where a player
+    // looking for the colours goes first.
+    val drawers = OptionsDrawer.entries.filter { it != OptionsDrawer.PALETTES }
+    val cursor = rememberCursorLayer(drawers.size) { onOpen(drawers[it]) }
+    ScreenColumn {
+        item {
+            Gen1Frame(
+                Modifier.wrapContentWidth(),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                drawers.forEachIndexed { index, entry ->
+                    Gen1MenuRow(
+                        entry.label,
+                        selected = cursor == index,
+                        onSelect = {},
+                        onConfirm = { onOpen(entry) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** One line in a drawer: a word, what it currently says, and what taking it does. */
+private data class OptionRow(
+    val label: String,
+    val trailing: String? = null,
+    val enabled: Boolean = true,
+    val swatch: GbPalette? = null,
+    val action: () -> Unit,
+)
+
+/**
+ * A drawer's contents, all on one cursor.
+ *
+ * Every choice a drawer offers goes in one list and one cursor layer runs
+ * down it, so a swipe reaches a switch here exactly as it reaches a menu row
+ * anywhere else. Two layers on one screen would mean only the top one moved,
+ * which is how the settings ended up half-reachable.
+ */
+@Composable
+private fun OptionsDrawerContent(
+    drawer: OptionsDrawer,
+    state: UiState,
+    model: StorageViewModel,
+    onShareReport: () -> Unit,
+    /** For a drawer with a drawer of its own: VISUAL opens PALETTES. */
+    onOpen: (OptionsDrawer) -> Unit,
+    onBack: () -> Unit,
+) {
+    val audio = LocalGen1Audio.current
+    // One trip into a folder rather than one file at a time: every ROM the
+    // player has, in whatever folder they keep their dumps in, identified
+    // and imported by content in one pass rather than asked for six times
+    // over. See RomFolderImporter.
+    val pickRomsFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) model.importRomsFolder(uri)
+    }
+    // The same folder chooser ROMS uses to pick a folder full of cartridge
+    // dumps, pointed at a folder to push a backup into instead — a folder
+    // inside the Google Drive app is exactly as pickable as one in local
+    // storage, since it is the system's own picker either way. Taking a
+    // persistable permission on the result is what makes every push after
+    // the first one silent: no sign-in of this app's own, because there is
+    // none — the permission already covers it. Also how BACKUP FOLDER is
+    // taken whether a folder is linked yet or not: tapping it always opens
+    // this, and picking a new one simply replaces whichever was linked
+    // before, which is the one way this drawer offers to change it.
+    val pickBackupFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) model.linkBackupFolder(uri)
+    }
+    // The same restore the tour offers a returning player, here for anyone
+    // who wants it without redoing the tour — a fresh install that never
+    // synced included, since a backup can carry the sync codes to link with
+    // as easily as it carries the boxes.
+    val pickImportBackupFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) model.restoreFromBackupFolder(uri)
+    }
+    // A single zip rather than a folder: a mod is one file to hand someone,
+    // not a folder to point at. Scanned whole before anything in it is
+    // trusted — see StorageViewModel.importMod.
+    val pickMod = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) model.importMod(uri)
+    }
+
+    val rows = buildList {
+        when (drawer) {
+            OptionsDrawer.VISUAL -> {
+                // The games' own first option, and in their order: FAST, MID,
+                // SLOW, taken by pressing the row.
+                add(OptionRow("TEXT SPEED", state.textSpeed.label) { model.cycleTextSpeed() })
+                // The colours have a drawer of their own: there are fourteen
+                // of them now and they were burying the three rows under
+                // them.
+                add(
+                    OptionRow(
+                        "PALETTES",
+                        trailing = GbPalette.fromId(state.paletteId).label,
+                        swatch = GbPalette.fromId(state.paletteId),
+                    ) { onOpen(OptionsDrawer.PALETTES) }
+                )
+                add(
+                    OptionRow(
+                        "BLACK ON WHITE BOXES",
+                        trailing = if (!state.windowsFollowPalette) "ON" else "OFF",
+                    ) { model.setWindowsFollowPalette(!state.windowsFollowPalette) }
+                )
+                add(
+                    OptionRow("PRINT BORDER", state.printBorder.label) {
+                        val all = PrintBorder.entries
+                        model.setPrintBorder(all[(all.indexOf(state.printBorder) + 1) % all.size])
+                    }
+                )
+                // Which colours a sprite is drawn in. PALETTE draws every
+                // one of them through the palette chosen above, so a box of
+                // Pokemon out of six different games is one picture.
+                // ORIGINAL draws each in the colours of the game it came
+                // from: Generation II art has those in its own files, and
+                // Generation I art is four greys, so Red's are the reds off
+                // Red's own card and Blue's the blues off Blue's.
+                add(
+                    OptionRow(
+                        "SPRITE COLOURS",
+                        if (state.gbcFollowsPalette) "PALETTE" else "ORIGINAL",
+                    ) { model.setGbcFollowsPalette(!state.gbcFollowsPalette) }
+                )
+            }
+
+            OptionsDrawer.PALETTES -> {
+                // A palette drawn from a game's own colours (or from a
+                // legendary that game's own box art carried) is that game's
+                // own cartridge proven, not a free extra — dumping one is the
+                // only way in.
+                //
+                // Not in the list at all until then, rather than sat in it
+                // greyed out. Eight rows reading "NEEDS GOLD" over a swatch
+                // nobody can take is a worse list than a short one, and the
+                // names were losing a fight for the width with the reason
+                // they were unavailable — HO-OH came out as "HO-…". They
+                // arrive announced instead: importing the ROM says which
+                // palettes it just opened up. See [StorageViewModel.unlockedBy].
+                // Whatever this device has imported a mod for, listed the
+                // same way a game's own palette is once its ROM is in: a
+                // mod palette carries no ROM requirement of its own, so it
+                // is simply here from the moment ModStore has registered it.
+                GbPalette.allIncludingMods
+                    .filter { it.requiredRom == null || model.roms.has(it.requiredRom) }
+                    .forEach { palette ->
+                        add(
+                            OptionRow(
+                                palette.label,
+                                trailing = if (state.paletteId == palette.id) "ON" else null,
+                                swatch = palette,
+                            ) { model.setPalette(palette.id) }
+                        )
+                    }
+            }
+
+            OptionsDrawer.MODS -> {
+                // Only ever colours and pictures this app already had a
+                // place to draw — see ModManifest — so nothing here is
+                // shown as anything more than what it changes the look of.
+                val installed = model.mods.list()
+                if (installed.isEmpty()) {
+                    add(OptionRow("NO MODS INSTALLED", enabled = false) {})
+                } else {
+                    installed.forEach { mod ->
+                        add(
+                            OptionRow(
+                                mod.manifest.name,
+                                trailing = if (mod.manifest.palette != null) "PALETTE" else null,
+                            ) {
+                                model.prompt(
+                                    Prompt.Confirm(
+                                        lines = listOf("REMOVE ${mod.manifest.name}?"),
+                                        confirmLabel = "YES",
+                                        cancelLabel = "NO",
+                                        onConfirm = { model.removeMod(mod.id) },
+                                    )
+                                )
+                            }
+                        )
+                    }
+                }
+                add(
+                    OptionRow("IMPORT MOD") {
+                        pickMod.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+                    }
+                )
+            }
+
+            OptionsDrawer.AUDIO -> {
+                add(
+                    OptionRow("DISABLE ALL", trailing = if (state.soundOff) "ON" else "OFF") {
+                        model.setSoundOff(!state.soundOff)
+                    }
+                )
+                if (!state.soundOff) {
+                    SoundEffect.entries.forEach { effect ->
+                        val on = effect.id in state.soundsOn
+                        add(OptionRow(effect.label, trailing = if (on) "ON" else "OFF") {
+                            model.setSoundEnabled(effect, !on)
+                        })
+                    }
+                }
+            }
+
+            OptionsDrawer.MOTION -> {
+                // First, because it changes how the rest of the app is
+                // touched rather than how it looks or sounds.
+                add(
+                    OptionRow("SWIPE CONTROLS", if (state.swipeControls) "ON" else "OFF") {
+                        model.setSwipeControls(!state.swipeControls)
+                    }
+                )
+                add(
+                    OptionRow("VIBRATION", if (state.haptics) "ON" else "OFF") {
+                        model.setHaptics(!state.haptics)
+                    }
+                )
+                add(
+                    OptionRow("REDUCE MOTION", if (state.reduceMotion) "ON" else "OFF") {
+                        model.setReduceMotion(!state.reduceMotion)
+                    }
+                )
+                // Still listed while REDUCE MOTION is on, and still settable:
+                // turning that off should give a player back exactly the
+                // choices they had, not a set of defaults.
+                Motion.entries.forEach { motion ->
+                    val on = motion.id in state.motionsOn
+                    add(
+                        OptionRow(
+                            motion.label,
+                            trailing = if (state.reduceMotion) "OFF" else if (on) "ON" else "OFF",
+                            enabled = !state.reduceMotion,
+                        ) { model.setMotionEnabled(motion, !on) }
+                    )
+                }
+            }
+
+            OptionsDrawer.LAYOUT -> {
+                add(
+                    OptionRow("ALIGNMENT", if (state.windowsOnRight) "RIGHT" else "LEFT") {
+                        model.setWindowsOnRight(!state.windowsOnRight)
+                    }
+                )
+                add(OptionRow("ALL POKéMON", if (state.showAllSaves) "ON" else "OFF") {
+                    model.setShowAllSaves(!state.showAllSaves)
+                })
+                add(OptionRow("ALL ITEMS", if (state.showAllItems) "ON" else "OFF") {
+                    model.setShowAllItems(!state.showAllItems)
+                })
+                add(OptionRow("GAME SELECTION", if (state.gameSelection) "ON" else "OFF") {
+                    model.setGameSelection(!state.gameSelection)
+                })
+                add(
+                    OptionRow("BILL'S PC", if (state.billsPc) "ON" else "OFF") {
+                        model.setBillsPc(!state.billsPc)
+                    }
+                )
+                add(
+                    OptionRow("TRADE MACHINE", if (state.tradeEvolution) "ON" else "OFF") {
+                        model.setTradeEvolution(!state.tradeEvolution)
+                    }
+                )
+                if (state.tradeEvolution) {
+                    add(
+                        OptionRow("SHOW EVOLUTIONS", if (state.tradeAnimation) "ON" else "OFF") {
+                            model.setTradeAnimation(!state.tradeAnimation)
+                        }
+                    )
+                }
+            }
+
+            OptionsDrawer.DOWNLOADS -> {
+                // One button. There are four sets of art and no reason to ask
+                // about them one at a time: the app wants all of it, anything
+                // missing shows as a gap wherever it was needed, and choosing
+                // to have three quarters of it is not a choice worth offering.
+                val progress = model.downloadProgress()
+                val running = progress != null && !progress.finished
+                val here = model.downloadedPercent()
+                when {
+                    running -> add(OptionRow("STOP", "${progress!!.percent}%") {
+                        model.cancelDownload()
+                    })
+                    here >= 100 -> add(OptionRow("EVERYTHING IS HERE", "100%", enabled = false) {})
+                    else -> add(
+                        OptionRow(
+                            if (here > 0) "DOWNLOAD THE REST" else "DOWNLOAD",
+                            "$here%",
+                        ) {
+                            model.prompt(
+                                Prompt.Confirm(
+                                    lines = listOf("Download all assets?"),
+                                    confirmLabel = "YES",
+                                    cancelLabel = "NO",
+                                    onConfirm = model::downloadEverything,
+                                )
+                            )
+                        }
+                    )
+                }
+                if (!running && here > 0) {
+                    add(OptionRow("DELETE", "${model.downloadBytesOnDisk() / (1024 * 1024)} MB") {
+                        model.prompt(
+                            Prompt.Confirm(
+                                lines = listOf("DELETE EVERYTHING DOWNLOADED?"),
+                                confirmLabel = "YES",
+                                cancelLabel = "NO",
+                                onConfirm = model::deleteDownloads,
+                            )
+                        )
+                    })
+                }
+                if (!running && progress != null) {
+                    add(OptionRow("OK") { model.dismissDownloadProgress() })
+                }
+            }
+
+            OptionsDrawer.ROMS -> {
+                // Sprites read straight out of the player's own ROM instead
+                // of a downloaded archive — a copy of a game only its owner
+                // could have dumped, kept only on this device and never sent
+                // anywhere by this app. One folder, once, rather than picking
+                // each of the six out one at a time: whichever of them are in
+                // it are found by their own bytes, never by what the file is
+                // named, and imported together. See RomFolderImporter.
+                add(
+                    OptionRow("IMPORT ROMS FOLDER") { pickRomsFolder.launch(null) }
+                )
+                com.logie.gen1storage.rom.RomVersion.entries.forEach { version ->
+                    val here = model.roms.has(version)
+                    add(
+                        OptionRow(
+                            version.label,
+                            trailing = if (here) "${model.roms.sizeOf(version) / (1024 * 1024)} MB" else "NOT HERE",
+                            enabled = here,
+                        ) {
+                            model.prompt(
+                                Prompt.Confirm(
+                                    lines = listOf("REMOVE THE ${version.label} ROM?"),
+                                    confirmLabel = "YES",
+                                    cancelLabel = "NO",
+                                    onConfirm = { model.deleteRom(version) },
+                                )
+                            )
+                        }
+                    )
+                }
+            }
+
+            OptionsDrawer.SAVES -> {
+                // These two — or ENTER SYNC CODES in their place — are drawn
+                // in the STATUS window above rather than down here: they are
+                // what the status just above them is a status of, and a
+                // player reading LINKED wants the row that acts on that
+                // right there rather than a scroll away. See
+                // savesHeaderRowCount, which is what tells the rendering
+                // below to lift exactly this many rows out of this box.
+                if (state.linked) {
+                    add(OptionRow("SYNC NOW", enabled = !state.syncing) {
+                        audio?.play(SoundEffect.SAVE)
+                        model.sync()
+                    })
+                    add(OptionRow("UNLINK") {
+                        model.prompt(
+                            Prompt.Confirm(
+                                lines = listOf("UNLINK THIS DEVICE?"),
+                                confirmLabel = "YES",
+                                cancelLabel = "NO",
+                                onConfirm = { model.unlink() },
+                            )
+                        )
+                    })
+                } else {
+                    add(OptionRow("ENTER SYNC CODES") { model.open(Screen.Link) })
+                }
+                // Offered whether this device has synced yet or not: a
+                // backup is a whole machine's worth of data, sync link and
+                // all, so a fresh install with backup data to bring in has
+                // no need to sync first just to get this row. Confirmed
+                // first, the same as UNLINK above, because it replaces
+                // whatever this device already has rather than adding to
+                // it.
+                add(
+                    OptionRow("IMPORT BACKUP") {
+                        model.prompt(
+                            Prompt.Confirm(
+                                lines = listOf("THIS REPLACES EVERYTHING", "ON THIS DEVICE. IMPORT A BACKUP?"),
+                                confirmLabel = "YES",
+                                cancelLabel = "NO",
+                                onConfirm = { pickImportBackupFolder.launch(null) },
+                            )
+                        )
+                    }
+                )
+                // Behind the same [state.linked] SYNC NOW and UNLINK are
+                // already gated on: a folder to push a PC into is not worth
+                // asking for from a device that has not yet synced with the
+                // game. Past that this is meant to run quietly — the tour
+                // already asks where to put it, before ROMS — so the only
+                // two things left here are choosing where, and forcing the
+                // one right now a player might actually want to watch
+                // happen. See BackupFolderWriter and
+                // StorageViewModel.pushToBackupFolder for what answers them.
+                if (state.linked) {
+                    add(
+                        OptionRow("BACKUP FOLDER", if (state.backupFolderLinked) "LINKED" else "NOT LINKED") {
+                            pickBackupFolder.launch(null)
+                        }
+                    )
+                    add(OptionRow("EXPORT MANUALLY") { model.exportBackupNow() })
+                }
+            }
+
+            OptionsDrawer.ABOUT -> {
+                add(OptionRow("CREDITS") { model.open(Screen.Credits) })
+                // The first-run introduction, on demand. It plays itself once
+                // and is then never seen again, which is right for a tour and
+                // wrong for the one person who wanted to watch it twice.
+                add(OptionRow("REPLAY TUTORIAL") { model.replayTutorial() })
+                add(OptionRow("SEND REPORT", action = onShareReport))
+            }
+        }
+        add(OptionRow("BACK", action = onBack))
+    }
+
+    // A row the drawer has greyed out is not a choice, and A should not be
+    // able to take one the way a tap never could.
+    val cursor = rememberCursorLayer(rows.size) { rows[it].takeIf(OptionRow::enabled)?.action?.invoke() }
+
+    // How many rows at the front of SAVES' list belong in the STATUS window
+    // instead of the one below it — SYNC NOW and UNLINK, or ENTER SYNC CODES
+    // in their place, are the action that status is a status of. Zero for
+    // every other drawer, which is what keeps this from touching them.
+    val savesHeaderRowCount = if (drawer == OptionsDrawer.SAVES) {
+        if (state.linked) 2 else 1
+    } else 0
+
+    ScreenColumn {
+        item { Gen1Frame(Modifier.wrapContentWidth()) { GbText(drawer.label) } }
+
+        if (drawer == OptionsDrawer.SAVES) {
+            item {
+                Gen1Frame {
+                    Gen1Field("STATUS", if (state.linked) "LINKED" else "NOT LINKED")
+                    state.lastSyncedAtMillis?.let {
+                        Gen1Field(
+                            "LAST SYNC",
+                            java.time.Instant.ofEpochMilli(it).toString().take(19),
+                        )
+                    }
+                    model.linkedDeviceLabel?.let { Gen1Field("THIS DEVICE", it) }
+                    Spacer(Modifier.height(gen1Dp(2)))
+                    for (index in 0 until savesHeaderRowCount) {
+                        val row = rows[index]
+                        Gen1MenuRow(
+                            row.label,
+                            selected = cursor == index,
+                            onSelect = {},
+                            onConfirm = row.action,
+                            trailing = row.trailing,
+                            enabled = row.enabled,
+                        )
+                    }
+                }
+            }
+        }
+
+        // One bar over the whole download rather than four in a row: the sets
+        // run one after another, and a bar that restarts three times reads as
+        // three downloads rather than as one that is three quarters done.
+        if (drawer == OptionsDrawer.DOWNLOADS) {
+            val progress = model.downloadProgress()
+            if (progress != null) {
+                item {
+                    Gen1Frame(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp)) {
+                        DownloadProgressBar(progress.percent, Modifier.fillMaxWidth())
+                        if (progress.finished) {
+                            Spacer(Modifier.height(gen1Dp(3)))
+                            // What did not arrive, said out loud. It was
+                            // counted all along and never shown, so a run that
+                            // lost twenty files read as a complete success and
+                            // the art was simply missing afterwards with
+                            // nothing to explain it.
+                            GbText(
+                                when {
+                                    progress.error != null ->
+                                        "STOPPED: ${progress.error.uppercase()}"
+                                    progress.failed > 0 ->
+                                        "DONE. ${progress.failed} DID NOT ARRIVE."
+                                    else -> "DONE."
+                                },
+                                style = Gen1TextSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            Gen1Frame(contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+                // A window of rows that is taller than the screen scrolls
+                // inside itself, and follows the cursor while it does. The
+                // rows used to be laid out one after another inside the
+                // frame, which is one lazy item however many of them there
+                // are: a drawer with fourteen palettes in it simply ran off
+                // the bottom of the phone and the last of them could not be
+                // reached at all.
+                val scroll = rememberLazyListState()
+                // The rows drawn in the STATUS window above are not in this
+                // list, so their positions do not line up with it — this box
+                // is offset by however many of them there are, and a cursor
+                // sitting on one of them (a negative result, clamped to the
+                // top) has nothing here to scroll to anyway.
+                LaunchedEffect(cursor) { scroll.scrollToRow(cursor - savesHeaderRowCount) }
+                LazyColumn(
+                    Modifier.heightIn(max = drawerRowsHeight()),
+                    state = scroll,
+                    userScrollEnabled = !LocalGen1Swipe.current,
+                ) {
+                // Already drawn above, in the STATUS window: see
+                // savesHeaderRowCount.
+                itemsIndexed(rows.drop(savesHeaderRowCount)) { offset, row ->
+                    val index = offset + savesHeaderRowCount
+                    if (row.swatch != null) {
+                        Row(
+                            Modifier.fillMaxWidth().gen1Clickable { row.action() },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Gen1MenuRow(
+                                row.label,
+                                selected = cursor == index,
+                                onSelect = {},
+                                onConfirm = row.action,
+                                trailing = row.trailing,
+                                modifier = Modifier.weight(1f),
+                            )
+                            PaletteSwatch(row.swatch)
+                        }
+                    } else {
+                        Gen1MenuRow(
+                            row.label,
+                            selected = cursor == index,
+                            onSelect = {},
+                            onConfirm = row.action,
+                            trailing = row.trailing,
+                            enabled = row.enabled,
+                        )
+                    }
+                }
+                }
+            }
+        }
+
+        if (drawer == OptionsDrawer.ABOUT) item { OptionsLinkRow() }
+    }
+}
+
+
+@Composable
+private fun OptionsLinkRow() {
+    val context = LocalContext.current
+    Gen1Frame(Modifier.wrapContentWidth()) {
+        GbText("LOGIE 2026")
+        // The whole line is the link. A URL at this size is a hard thing to
+        // hit, and the row around it is not doing anything else.
+        Gen1MenuRow(
+            "github.com/logie-github/TM-Case",
+            selected = false,
+            onSelect = {},
+            onConfirm = {
+                runCatching {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(TM_CASE_REPO)))
+                }
+            },
+        )
+    }
+}
+
+/**
+ * Who made what this app is built out of, and whose the rest of it is.
+ *
+ * Given the whole screen rather than a column of windows: it is the one page
+ * here that is meant to be read rather than used, and breaking it into boxes
+ * would make it harder to.
+ */
+@Composable
+fun CreditsScreen() {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .gen1Ground()
+            .padding(gen1Dp(4)),
+    ) {
+        Gen1Frame(Modifier.fillMaxSize()) {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(gen1Dp(4)),
+                userScrollEnabled = !LocalGen1Swipe.current,
+            ) {
+                item { GbText("CREDITS", style = Gen1TextLarge) }
+                item {
+                    Credit(
+                        "GEN 1 RECOMP",
+                        "BY BRYANTHABOI",
+                        "github.com/bryanthaboi/",
+                        "gen1recomp",
+                    )
+                }
+                item {
+                    Credit(
+                        "SPRITES",
+                        "THE RBY SPRITES PROJECT",
+                        "BY SHIRATHEMOGUL",
+                        "github.com/ShiraTheMogul/",
+                        "rby-sprites-project",
+                    )
+                }
+                item {
+                    Credit(
+                        "CRIES",
+                        "NOTE DATA FROM PRET,",
+                        "SYNTHESISED ON DEVICE",
+                    )
+                }
+                item {
+                    Credit(
+                        "FOLLOWERS",
+                        "POKEPCFOLLOWERS",
+                        "FORK BY BURGERSLAYER7",
+                        "github.com/burgerslayer7/",
+                        "PokePCFollowers",
+                    )
+                }
+                item {
+                    Credit(
+                        "FOLLOWERS, ORIGINAL",
+                        "POKEPCFOLLOWERS",
+                        "BY GAMECORNER-033",
+                        "github.com/gamecorner-033/",
+                        "PokePCFollowers",
+                    )
+                }
+                item {
+                    Credit(
+                        "FOLLOWER ART",
+                        "SHOCKSLAYER AND THE",
+                        "FOLLOWERS EX / POKEPC LINEAGE",
+                    )
+                }
+                item {
+                    Credit(
+                        "FONT",
+                        "POKEMON-FONT BY SUPERPENCIL",
+                        "SIL OPEN FONT LICENSE 1.1",
+                        "github.com/cooljeanius/",
+                        "pokemon-font",
+                    )
+                }
+                item {
+                    Credit(
+                        "GAME DATA",
+                        "PRET/POKERED",
+                        "github.com/pret/pokered",
+                    )
+                }
+                item {
+                    Credit(
+                        "GEN II DATA",
+                        "PRET/POKEGOLD",
+                        "PRET/POKECRYSTAL",
+                        "github.com/pret/pokegold",
+                    )
+                }
+                item { Spacer(Modifier.height(gen1Dp(4))) }
+                item {
+                    Column {
+                        GbText("POKéMON")
+                        Spacer(Modifier.height(gen1Dp(2)))
+                        LEGAL.forEach { paragraph ->
+                            GbText(paragraph, style = Gen1TextSmall)
+                            Spacer(Modifier.height(gen1Dp(3)))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun Credit(heading: String, vararg lines: String) {
+    Column {
+        GbText(heading)
+        lines.forEach { GbText(it, style = Gen1TextSmall) }
+    }
+}
+
+/**
+ * Kept as its own text rather than folded into the layout, so it is obvious
+ * what is a statement and what is furniture.
+ */
+private val LEGAL = listOf(
+    "© THE POKéMON COMPANY, NINTENDO, AND GAME FREAK.",
+    "POKéMON AND ALL RELATED NAMES, CHARACTERS, TRADEMARKS, AND INTELLECTUAL PROPERTY ARE THE PROPERTY OF THEIR RESPECTIVE OWNERS.",
+    "THIS PROJECT IS NOT AFFILIATED WITH, ENDORSED BY, SPONSORED BY, OR OTHERWISE ASSOCIATED WITH THE POKéMON COMPANY, NINTENDO, OR GAME FREAK. THIS PROJECT GRATEFULLY ACKNOWLEDGES THEIR IDEAS, CREATIVE WORK, AND CONTRIBUTIONS TO THE POKéMON FRANCHISE.",
+    "NO COPYRIGHT INFRINGEMENT IS INTENDED.",
+    "NO RIPPED GAME ASSETS ARE DISTRIBUTED IN THIS APK.",
+)
+
+/**
+ * Naming something — a box, a cartridge — in a window sized to the name.
+ *
+ * Ten characters, which is what the games allow and what the label on a
+ * cartridge has room for. CLEAR puts it back to whatever it was called before
+ * anyone renamed it.
+ */
+@Composable
+private fun NamePrompt(
+    heading: String,
+    initial: String,
+    onDone: (String) -> Unit,
+    onCancel: () -> Unit,
+    maxLength: Int = StorageRepository.MAX_BOX_NAME,
+) {
+    var name by remember(heading) { mutableStateOf(initial) }
+    // The field itself belongs to the keyboard; the three choices under it are
+    // ordinary rows on the cursor, so the window can be finished without one.
+    val at = rememberCursorLayer(3, columns = 3) { index ->
+        when (index) {
+            0 -> onDone(name)
+            1 -> onDone("")
+            else -> onCancel()
+        }
+    }
+    Gen1Frame(Modifier.wrapContentWidth()) {
+        GbText(heading)
+        Spacer(Modifier.height(gen1Dp(2)))
+        OutlinedTextField(
+            value = name,
+            onValueChange = { text ->
+                name = text.filter { it != '\n' }.take(maxLength)
+            },
+            singleLine = true,
+            textStyle = Gen1Text,
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Gen1Palette.Panel,
+                unfocusedContainerColor = Gen1Palette.Panel,
+                focusedTextColor = Gen1Palette.Ink,
+                unfocusedTextColor = Gen1Palette.Ink,
+                focusedIndicatorColor = Gen1Palette.Ink,
+                unfocusedIndicatorColor = Gen1Palette.Shadow,
+                cursorColor = Gen1Palette.Ink,
+            ),
+            modifier = Modifier.width(gen1Dp(90)),
+        )
+        Spacer(Modifier.height(gen1Dp(3)))
+        Row(horizontalArrangement = Arrangement.spacedBy(gen1Dp(3))) {
+            Gen1Button("OK", { onDone(name) }, selected = at == 0)
+            Gen1Button("CLEAR", { onDone("") }, selected = at == 1)
+            Gen1Button("CANCEL", onCancel, selected = at == 2)
+        }
+    }
+}
+
+/**
+ * The only place a save is named.
+ *
+ * A save is shown by its game and trainer — the playthrough id it is really
+ * keyed by is an implementation detail and never appears. If the blob has been
+ * fetched the party count comes with it; otherwise the row still works and the
+ * count fills in once it loads.
+ */
+@Composable
+private fun PaletteSwatch(palette: GbPalette) {
+    Row(
+        Modifier
+            .background(Gen1Palette.Ink)
+            .padding(2.dp)
+    ) {
+        // Lightest first, so it reads left to right the way the ramp is written.
+        palette.ramp.reversed().forEach { shade ->
+            Box(Modifier.size(width = 14.dp, height = 20.dp).background(shade))
+        }
+    }
+}
+
+private const val TM_CASE_REPO = "https://github.com/logie-github/TM-Case"
+
+/** An on/off row drawn as a menu entry with its state in the right column. */
+@Composable
+private fun Gen1Toggle(
+    label: String,
+    on: Boolean,
+    onToggle: () -> Unit,
+    onLabel: String = "ON",
+    offLabel: String = "OFF",
+    /** Whether the cursor is on this row. The arrow means nothing else. */
+    selected: Boolean = false,
+) {
+    // A switch says what it is through its trailing word, and only that. It
+    // used to light the cursor arrow as well, which left rows in OPTIONS
+    // wearing arrows that had nothing to do with where the cursor was.
+    Gen1MenuRow(
+        label,
+        selected = selected,
+        onSelect = onToggle,
+        onConfirm = onToggle,
+        trailing = if (on) onLabel else offLabel,
+    )
+}
+
+/**
+ * A column of windows over the screen.
+ *
+ * Each window is sized to what is in it and pinned to the same edge the PC's
+ * menus use, so a strip of the dithered ground always shows down the other
+ * side. Nothing here reaches both edges at once.
+ */
+@Composable
+fun ScreenColumn(content: LazyListScope.() -> Unit) {
+    LazyColumn(
+        Modifier
+            .fillMaxSize()
+            .gen1Ground(),
+        contentPadding = PaddingValues(
+            start = gen1Dp(2),
+            end = gen1Dp(2),
+            top = gen1Dp(2),
+            bottom = gen1Dp(6),
+        ),
+        verticalArrangement = Arrangement.spacedBy(gen1Dp(4)),
+        // The same edge the menus use, so a screen of windows and the PC read
+        // as the same machine rather than as two.
+        horizontalAlignment = Gen1Layout.menuSide,
+        userScrollEnabled = !LocalGen1Swipe.current,
+        content = content,
+    )
+}
+
+@Composable
+fun PromptWindow(state: UiState, model: StorageViewModel) {
+    val prompt = state.prompt ?: return
+    // No scrim and no centring: a prompt is a window like every other
+    // window here, so it opens in the same corner the action windows do and
+    // leaves what it came from readable behind it.
+    Box(
+        Modifier.fillMaxSize().padding(gen1Dp(4)),
+        contentAlignment = Gen1Layout.corner(top = false, menuSide = true),
+    ) {
+        when (prompt) {
+            is Prompt.Message -> {
+                val context = LocalContext.current
+                // A landed transfer is on the server; the cartridge gets it
+                // the next time the game syncs, and the game syncs on the way
+                // into a save. So the window that says the transfer happened
+                // is where the trip to the game belongs — one tap instead of
+                // leaving, finding the icon, and waiting on a timer.
+                //
+                // Offered only when the game is actually installed: a row that
+                // answers "that app is not here" is a row that never did
+                // anything.
+                val game = prompt.openGame?.takeIf { TheGame.isInstalled(context) }
+                Gen1DialogueBox(prompt.lines.map { it.uppercase() } + syncLines(game), fit = true) {
+                Spacer(Modifier.height(gen1Dp(2)))
+                Gen1ChoiceRows(
+                    if (game == null) listOf("OK" to model::dismissPrompt)
+                    else listOf(
+                        "YES" to {
+                            model.dismissPrompt()
+                            openTheGame(context, model, game, game.slot)
+                        },
+                        "NO" to model::dismissPrompt,
+                    )
+                )
+                }
+            }
+
+            is Prompt.Confirm -> Gen1DialogueBox(prompt.lines.map { it.uppercase() }, fit = true) {
+                Spacer(Modifier.height(gen1Dp(2)))
+                Gen1ChoiceRows(
+                    listOf(
+                        prompt.confirmLabel to prompt.onConfirm,
+                        prompt.cancelLabel to model::dismissPrompt,
+                    )
+                )
+            }
+
+            is Prompt.RenameBox -> NamePrompt(
+                heading = state.storage.boxes.firstOrNull()?.label ?: "THE PC",
+                initial = state.storage.boxes.getOrNull(prompt.index - 1)?.name.orEmpty(),
+                onDone = { model.renameBox(prompt.index, it) },
+                onCancel = model::dismissPrompt,
+            )
+
+            is Prompt.RenameMon -> {
+                val stored = state.storage.find(prompt.uid)?.second
+                NamePrompt(
+                    heading = stored?.pokemon?.let {
+                        (it.species?.displayName ?: it.speciesId.orEmpty()).uppercase()
+                    } ?: "POKéMON",
+                    initial = stored?.pokemon?.nickname.orEmpty(),
+                    maxLength = StorageRepository.MAX_NICKNAME,
+                    onDone = { model.renameStored(prompt.uid, it) },
+                    onCancel = model::dismissPrompt,
+                )
+            }
+
+            is Prompt.RenameCart -> NamePrompt(
+                heading = prompt.fallback,
+                initial = model.cartName(prompt.key).orEmpty(),
+                onDone = { model.renameCart(prompt.key, it) },
+                onCancel = model::dismissPrompt,
+            )
+
+            is Prompt.Update -> {
+                val context = LocalContext.current
+                Gen1Frame(Modifier.wrapContentWidth(), opening = true) {
+                    GbText("VERSION ${prompt.version} IS OUT.")
+                    GbText("UPDATE?", style = Gen1TextSmall)
+                    Spacer(Modifier.height(gen1Dp(3)))
+                    val update = {
+                        model.dismissPrompt()
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(prompt.url))
+                            )
+                        }
+                        Unit
+                    }
+                    val at = rememberCursorLayer(2) { if (it == 0) update() else model.dismissPrompt() }
+                    Row(horizontalArrangement = Arrangement.spacedBy(gen1Dp(3))) {
+                        Gen1Button("YES", update, selected = at == 0)
+                        Gen1Button("NO", model::dismissPrompt, selected = at == 1)
+                    }
+                }
+            }
+
+            is Prompt.ChooseQuantity -> QuantityPrompt(
+                title = prompt.title,
+                max = prompt.max,
+                onChoose = { count -> model.dismissPrompt(); prompt.onChoose(count) },
+                onCancel = model::dismissPrompt,
+            )
+
+            is Prompt.ChooseTrainerSprite -> {
+                // A trainer this app has not fetched yet is a blank row here
+                // rather than a picture, and a player should never have to go
+                // find DOWNLOAD ALL in OPTIONS to make one appear. Cheap to
+                // call every time the picker opens: downloadTrainers skips
+                // whatever is already on disk and only reaches the network
+                // for what is actually missing.
+                LaunchedEffect(Unit) { model.downloadTrainers(dismissPrompt = false) }
+                TrainerSpritePicker(
+                    chosen = model.trainerSprite(prompt.key),
+                    store = model.trainers,
+                    revision = state.spriteRevision,
+                    version = state.remote(prompt.key)?.version,
+                    female = state.save(prompt.key)?.save?.isFemale == true,
+                    onChoose = { model.setTrainerSprite(prompt.key, it) },
+                    onCancel = model::dismissPrompt,
+                )
+            }
+
+            is Prompt.ChooseSpriteSet -> SpriteSetPicker(
+                speciesId = prompt.speciesId,
+                store = model.sprites,
+                onChoose = { model.chooseSpriteSet(prompt.speciesId, it) },
+                onCancel = model::dismissPrompt,
+            )
+
+            is Prompt.ReadMail -> {
+                val letter = prompt.letter
+                val heading = letter.author.ifBlank { itemLabel(letter.type) }.uppercase()
+                Gen1DialogueBox(listOf("$heading:", letter.message)) {
+                    Spacer(Modifier.height(gen1Dp(2)))
+                    Gen1ChoiceRows(listOf("OK" to model::dismissPrompt))
+                }
+            }
+
+            is Prompt.MailAction -> {
+                val letter = state.save(prompt.key)?.save
+                    ?.let { Gen2Mail.letter(it.root, prompt.slot) }
+                Gen1DialogueBox(listOf("MAIL")) {
+                    Spacer(Modifier.height(gen1Dp(2)))
+                    Gen1ChoiceRows(
+                        buildList {
+                            letter?.let {
+                                add("READ" to { model.prompt(Prompt.ReadMail(it)) })
+                            }
+                            add(
+                                "SEND TO PC" to {
+                                    model.prompt(
+                                        Prompt.Confirm(
+                                            lines = listOf("SEND THE REMOVED", "MAIL TO YOUR PC?"),
+                                            confirmLabel = "YES",
+                                            cancelLabel = "NO",
+                                            onConfirm = { model.sendMailToPc(prompt.key, prompt.slot) },
+                                        )
+                                    )
+                                }
+                            )
+                            add("CANCEL" to model::dismissPrompt)
+                        }
+                    )
+                }
+            }
+
+            is Prompt.MailboxAction -> {
+                val letter = state.save(prompt.key)?.save
+                    ?.let { Gen2Mail.mailbox(it.root).getOrNull(prompt.index - 1) }
+                Gen1DialogueBox(listOf("MAIL")) {
+                    Spacer(Modifier.height(gen1Dp(2)))
+                    Gen1ChoiceRows(
+                        buildList {
+                            letter?.let {
+                                add("READ MAIL" to { model.prompt(Prompt.ReadMail(it)) })
+                            }
+                            add(
+                                "ATTACH MAIL" to {
+                                    model.prompt(Prompt.AttachMail(prompt.key, prompt.index))
+                                }
+                            )
+                            add("CANCEL" to model::dismissPrompt)
+                        }
+                    )
+                }
+            }
+
+            is Prompt.AttachMail -> AttachMailPicker(
+                key = prompt.key,
+                mailboxIndex = prompt.mailboxIndex,
+                party = state.save(prompt.key)?.save?.party.orEmpty(),
+                onChoose = { index ->
+                    model.attachMailFromBox(prompt.key, prompt.mailboxIndex, index + 1)
+                },
+                onCancel = model::dismissPrompt,
+            )
+        }
+    }
+}

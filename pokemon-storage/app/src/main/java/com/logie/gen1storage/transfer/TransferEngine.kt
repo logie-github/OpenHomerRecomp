@@ -1,0 +1,581 @@
+package com.logie.gen1storage.transfer
+
+import com.logie.gen1storage.gen1recomp.Gen1RecompSave
+import com.logie.gen1storage.gen1recomp.SaveClassifier
+import com.logie.gen1storage.lua.LuaWriter
+import com.logie.gen1storage.pokemon.Gen1Pokemon
+import com.logie.gen1storage.storage.Hop
+import com.logie.gen1storage.storage.Lineage
+import com.logie.gen1storage.storage.LineageBook
+import com.logie.gen1storage.storage.Provenance
+import com.logie.gen1storage.storage.StorageRepository
+import com.logie.gen1storage.storage.StoredPokemon
+import com.logie.gen1storage.sync.CommitOutcome
+import com.logie.gen1storage.sync.LoadedSave
+import com.logie.gen1storage.sync.RemoteSave
+import com.logie.gen1storage.sync.SaveRepository
+import com.logie.gen1storage.sync.SyncResult
+import java.util.UUID
+
+/** Which side of a save a Pokémon sits on. */
+sealed interface SaveLocation {
+    /** 1-based party slot. */
+    data class Party(val slot: Int) : SaveLocation
+    /** 1-based box number and 1-based position inside it. */
+    data class Box(val box: Int, val slot: Int) : SaveLocation
+}
+
+/** Where a withdrawn Pokémon should land. */
+sealed interface WithdrawTarget {
+    data object Party : WithdrawTarget
+    data class Box(val box: Int) : WithdrawTarget
+}
+
+sealed interface TransferResult {
+    data class Success(
+        val message: String,
+        val storedUid: String?,
+        /**
+         * The touched save as it now stands, when one was written.
+         *
+         * Handed back so the caller can hold the cartridge at its new revision
+         * without fetching it again: these are the bytes the server just took.
+         * Null where nothing was written to a save.
+         */
+        val after: LoadedSave? = null,
+    ) : TransferResult
+    data class Refused(val reason: String) : TransferResult
+
+    /**
+     * The move stopped part-way and the journal holds the evidence. Neither a
+     * duplicate nor a loss has occurred: exactly one side is authoritative and
+     * [reason] says what has to happen next.
+     */
+    data class NeedsRecovery(val reason: String) : TransferResult
+}
+
+/** What crash recovery concluded. */
+data class RecoveryReport(val resolved: List<String>, val unresolved: List<String>)
+
+/**
+ * Moves Pokémon between a synced Gen1Recomp save and this app's storage.
+ *
+ * The invariant every step protects: **before a transfer there is exactly one
+ * authoritative copy of a Pokémon, and after it there is exactly one.** Both
+ * directions write the destination first and only remove the source once the
+ * destination is confirmed, and both journal the save's hash before and after
+ * so an interruption is settled by evidence rather than assumption.
+ *
+ * Over sync there is one failure mode a local file does not have: a request
+ * can fail *after* the server acted, leaving the outcome genuinely unknown.
+ * That is what [CommitOutcome.Unknown] means, and why recovery re-reads the
+ * save and compares hashes instead of trusting how far the code got.
+ */
+class TransferEngine(
+    private val saves: SaveRepository,
+    private val storage: StorageRepository,
+    private val journal: TransferJournal,
+    /**
+     * What the app believes it has already handed out. Consulted before a
+     * withdrawal so the same Pokémon cannot be written into a second cartridge.
+     */
+    private val ledger: PlacementLedger,
+    /**
+     * Where a Pokémon has been. Read on the way in so a Pokémon the app has
+     * held before picks its own history back up, written on the way out so
+     * that history survives the Pokémon leaving the boxes.
+     */
+    private val lineages: LineageBook,
+    private val now: () -> Long = System::currentTimeMillis,
+) {
+
+    /**
+     * The history this Pokémon arrives with, if the app has seen it before.
+     *
+     * The tag it was sent out with first, because that is exact. Failing
+     * that — a save restored from before the tag was written, a cartridge
+     * that did not keep it — what it looks like without one, which is weaker
+     * and still better than nothing. Null for one the app has never held.
+     */
+    private fun lineageArriving(mon: Gen1Pokemon): Lineage? {
+        Lineage.tagOf(mon.raw)?.let { tag -> return lineages.of(tag) ?: Lineage(tag) }
+        return Lineage.identityOf(mon)?.let { lineages.byIdentity(it) }
+    }
+
+    // ------------------------------------------------------------------
+    // Deposit: synced save -> this app
+    // ------------------------------------------------------------------
+
+    suspend fun deposit(
+        loaded: LoadedSave,
+        location: SaveLocation,
+        targetBox: Int = 1,
+    ): TransferResult {
+        if (!loaded.isWritable) {
+            return TransferResult.Refused(
+                "${loaded.remote.version.label} SAVES ARE READ ONLY IN THIS APP."
+            )
+        }
+        journal.read()?.let {
+            return TransferResult.Refused("A PREVIOUS TRANSFER IS UNRESOLVED. SYNC FIRST.")
+        }
+
+        // 1. Re-read now: anything listed or opened earlier may be stale.
+        val fresh = reload(loaded) ?: return TransferResult.Refused("THE SAVE COULD NOT BE READ")
+        if (fresh.fingerprint != loaded.fingerprint) {
+            return TransferResult.Refused("THE GAME CHANGED THIS SAVE. REFRESH AND TRY AGAIN.")
+        }
+        val save = fresh.save ?: return TransferResult.Refused("THAT SAVE CANNOT BE READ")
+
+        // 2. Confirm the selected Pokémon is where the app thinks it is.
+        val selected = pokemonAt(save, location)
+            ?: return TransferResult.Refused("THAT POKéMON IS NO LONGER THERE")
+
+        // 3. Constraint checks, before anything is written.
+        constraintForDeposit(save, location)?.let { return TransferResult.Refused(it) }
+
+        // 4. Build the post-transfer save and hash it.
+        val mutated = Gen1RecompSave(save.root.deepCopy())
+        val removed = when (location) {
+            is SaveLocation.Party -> mutated.removeFromParty(location.slot)
+            is SaveLocation.Box -> mutated.removeFromBox(location.box, location.slot)
+        } ?: return TransferResult.Refused("THAT POKéMON IS NO LONGER THERE")
+
+        val removedFingerprint = Gen1Pokemon(removed).fingerprint
+        if (removedFingerprint != selected.fingerprint) {
+            return TransferResult.Refused("THE SELECTED POKéMON DID NOT MATCH; NOTHING WAS CHANGED")
+        }
+        val encoded = LuaWriter.encode(mutated.root)
+        if (SaveClassifier.classify(encoded).save == null) {
+            return TransferResult.Refused("THE RESULTING SAVE WOULD BE INVALID; NOTHING WAS CHANGED")
+        }
+
+        // 5. Journal, then store. From here the Pokémon exists twice and the
+        //    journal is what says which copy is authoritative.
+        val uid = UUID.randomUUID().toString()
+        val entry = journalEntry(
+            kind = TransferKind.DEPOSIT,
+            uid = uid,
+            monFingerprint = removedFingerprint,
+            loaded = fresh,
+            before = fresh.fingerprint,
+            after = SaveRepository.sha256(encoded),
+            location = location,
+        )
+        journal.write(entry)
+
+        val stored = storage.deposit(
+            removed,
+            provenanceOf(fresh, save, entry),
+            targetBox,
+            uid,
+            generation = fresh.remote.version.generation,
+            lineage = lineageArriving(Gen1Pokemon(removed)),
+        )
+        if (stored == null) {
+            journal.clear()
+            return TransferResult.Refused("STORAGE IS FULL")
+        }
+        journal.write(entry.copy(stage = TransferStage.STORED))
+
+        // 6. Upload the save without the Pokémon.
+        return when (val outcome = saves.commit(fresh, mutated.root)) {
+            is CommitOutcome.Committed -> {
+                journal.clear()
+                // It has left that cartridge, so the app is no longer holding
+                // it there and a later withdrawal has nothing to refuse. Only
+                // that cartridge's record goes: see [PlacementLedger.forgetFrom].
+                //
+                // Bookkeeping, and bookkeeping never decides a transfer. The
+                // write has landed by this point; a ledger that could not be
+                // updated must not turn a move that happened into a failure
+                // report.
+                // Without the app's own mark on it. The ledger's records are
+                // written from the copy in the boxes, which never carries one
+                // (see [Lineage.unstamp]), so a key taken off the cartridge's
+                // copy — which does — would match nothing and the record
+                // would stand after the Pokémon had come home.
+                runCatching {
+                    ledger.forgetFrom(
+                        Gen1Pokemon(Lineage.unstamp(removed.deepCopy())).fingerprint,
+                        fresh.key,
+                    )
+                }
+                // The book and the boxes say the same thing about where this
+                // one has been. Bookkeeping, and after the fact, for the same
+                // reason the ledger above is.
+                runCatching {
+                    stored.lineage?.let {
+                        lineages.record(it, Lineage.identityOf(stored.pokemon))
+                    }
+                }
+                if (!holdsExactlyOne(uid)) {
+                    TransferResult.NeedsRecovery("THE PC DID NOT END UP WITH EXACTLY ONE COPY. CHECK STORAGE BOXES.")
+                } else {
+                    TransferResult.Success(
+                        "${Gen1Pokemon(removed).displayName.uppercase()} was stored in BOX $targetBox.",
+                        uid,
+                        outcome.after,
+                    )
+                }
+            }
+            // Refused and Conflict both mean the server did not take the write,
+            // so the save is authoritative and the stored copy is the duplicate.
+            is CommitOutcome.Refused -> rollBackDeposit(uid, outcome.reason)
+            is CommitOutcome.Conflict -> rollBackDeposit(uid, outcome.reason)
+            is CommitOutcome.Unknown -> TransferResult.NeedsRecovery(outcome.reason)
+        }
+    }
+
+    private fun rollBackDeposit(uid: String, reason: String): TransferResult {
+        storage.withdraw(uid)
+        journal.clear()
+        return TransferResult.Refused(reason)
+    }
+
+    // ------------------------------------------------------------------
+    // Withdraw: this app -> synced save
+    // ------------------------------------------------------------------
+
+    suspend fun withdraw(
+        loaded: LoadedSave,
+        uid: String,
+        target: WithdrawTarget,
+    ): TransferResult {
+        if (!loaded.isWritable) {
+            return TransferResult.Refused(
+                "${loaded.remote.version.label} SAVES ARE READ ONLY IN THIS APP."
+            )
+        }
+        journal.read()?.let {
+            return TransferResult.Refused("A PREVIOUS TRANSFER IS UNRESOLVED. SYNC FIRST.")
+        }
+        val stored = storage.get(uid) ?: return TransferResult.Refused("THAT POKéMON IS NOT IN STORAGE")
+
+        // A Pokémon only ever goes into a cartridge of its own generation.
+        //
+        // The games have exactly one way across and it is a deliberate act:
+        // the Time Capsule, which spends a catch rate on an item and splits
+        // one Special stat in two. Writing a Generation I Pokémon straight
+        // into a Gold save would put a table there that Gold cannot describe
+        // — no held item, no happiness, one Special where it expects two —
+        // and writing a Generation II one into Red would hand Red fields it
+        // has never heard of. Neither is a transfer; both are a corrupted
+        // save, which is the one thing this app must never do.
+        val saveGeneration = loaded.remote.version.generation
+        crossGenerationRefusal(stored, saveGeneration)?.let {
+            return TransferResult.Refused(it)
+        }
+
+        val fresh = reload(loaded) ?: return TransferResult.Refused("THE SAVE COULD NOT BE READ")
+        if (fresh.fingerprint != loaded.fingerprint) {
+            return TransferResult.Refused("THE GAME CHANGED THIS SAVE. REFRESH AND TRY AGAIN.")
+        }
+        val save = fresh.save ?: return TransferResult.Refused("THAT SAVE CANNOT BE READ")
+
+        constraintForWithdraw(save, target)?.let { return TransferResult.Refused(it) }
+
+        // The one write that can put a Pokémon in two places at once, so it is
+        // the one that checks. Both halves matter: a save restored from a
+        // backup can already hold it, and a cartridge this app wrote it to
+        // earlier can still be holding it even while nothing is loaded from
+        // that cartridge now.
+        val fingerprint = stored.pokemon.fingerprint
+        if (alreadyHolds(save, fingerprint)) {
+            return TransferResult.Refused(
+                "${stored.pokemon.displayName.uppercase()} IS ALREADY IN THAT SAVE."
+            )
+        }
+        runCatching { ledger.placement(fingerprint) }.getOrNull()?.let { held ->
+            if (held.saveKey != fresh.key) {
+                return TransferResult.Refused(
+                    "THE PC PUT ${stored.pokemon.displayName.uppercase()} IN ${held.savePath.uppercase()}. " +
+                        "TAKE IT OUT OF THERE FIRST."
+                )
+            }
+        }
+
+        val mutated = Gen1RecompSave(save.root.deepCopy())
+        // Marked on the way out, always — including one deposited before the
+        // app kept marks at all, which gets its first one here. The mark is
+        // what lets this Pokémon be recognised on the way back after a season
+        // of levels, moves and nicknames; see [Lineage].
+        val marked = stored.lineage ?: Lineage(Lineage.newTag())
+        val data = Lineage.stamp(stored.data.deepCopy(), marked.tag)
+        val placed = when (target) {
+            WithdrawTarget.Party -> mutated.addToParty(data)
+            is WithdrawTarget.Box -> mutated.addToBox(target.box, data)
+        }
+        if (!placed) return TransferResult.Refused("THERE IS NO ROOM FOR IT")
+
+        val encoded = LuaWriter.encode(mutated.root)
+        if (SaveClassifier.classify(encoded).save == null) {
+            return TransferResult.Refused("THE RESULTING SAVE WOULD BE INVALID; NOTHING WAS CHANGED")
+        }
+
+        val entry = journalEntry(
+            kind = TransferKind.WITHDRAW,
+            uid = uid,
+            monFingerprint = Gen1Pokemon(data).fingerprint,
+            loaded = fresh,
+            before = fresh.fingerprint,
+            after = SaveRepository.sha256(encoded),
+            location = when (target) {
+                WithdrawTarget.Party -> SaveLocation.Party(0)
+                is WithdrawTarget.Box -> SaveLocation.Box(target.box, 0)
+            },
+        )
+        journal.write(entry)
+
+        return when (val outcome = saves.commit(fresh, mutated.root)) {
+            is CommitOutcome.Committed -> {
+                // The save has it. Only now does the stored copy go.
+                journal.write(entry.copy(stage = TransferStage.SAVED))
+                storage.withdraw(uid)
+                journal.clear()
+                // Again bookkeeping, and again after the fact: the save has
+                // it either way.
+                runCatching {
+                    ledger.record(
+                        Placement(
+                            fingerprint = fingerprint,
+                            saveKey = fresh.key,
+                            savePath = entry.savePath,
+                            monName = stored.pokemon.displayName,
+                            atMillis = now(),
+                        )
+                    )
+                }
+                // Where it went, written down somewhere that is not the
+                // Pokémon — which has just left the boxes and taken its own
+                // copy of its history with it into the cartridge.
+                runCatching {
+                    lineages.record(
+                        marked.then(
+                            Hop(
+                                kind = Hop.Kind.WITHDRAWN,
+                                atMillis = now(),
+                                gameVersion = fresh.remote.version.id,
+                                saveKey = fresh.key,
+                                trainerName = save.trainerName,
+                            )
+                        ),
+                        Lineage.identityOf(stored.pokemon),
+                    )
+                }
+                TransferResult.Success(
+                    "${stored.pokemon.displayName.uppercase()} is taken out.",
+                    null,
+                    outcome.after,
+                )
+            }
+            is CommitOutcome.Refused -> { journal.clear(); TransferResult.Refused(outcome.reason) }
+            is CommitOutcome.Conflict -> { journal.clear(); TransferResult.Refused(outcome.reason) }
+            is CommitOutcome.Unknown -> TransferResult.NeedsRecovery(outcome.reason)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Recovery
+    // ------------------------------------------------------------------
+
+    /**
+     * Resolves an interrupted transfer from the save's current bytes.
+     *
+     * Three answers, no guesswork: the save still hashes to what it was before
+     * the write (it never landed), to what it would be after (it landed), or to
+     * neither — the game saved in between, in which case both copies are kept
+     * and the player is told.
+     */
+    suspend fun recover(known: List<RemoteSave>): RecoveryReport {
+        val entry = journal.read() ?: return RecoveryReport(emptyList(), emptyList())
+        val remote = known.firstOrNull { it.key == entry.saveId }
+            ?: return RecoveryReport(
+                emptyList(),
+                listOf(
+                    "A ${entry.kind.name.lowercase()} on ${entry.savePath} is unresolved: " +
+                        "that save is not on the account right now, so both copies were kept."
+                ),
+            )
+
+        val current = saves.currentFingerprint(remote)
+            ?: return RecoveryReport(
+                emptyList(),
+                listOf(
+                    "A ${entry.kind.name.lowercase()} on ${entry.savePath} is unresolved: " +
+                        "the save could not be read, so both copies were kept."
+                ),
+            )
+
+        val landed = when (current) {
+            entry.saveHashAfter -> true
+            entry.saveHashBefore -> false
+            else -> return RecoveryReport(
+                emptyList(),
+                listOf(
+                    "A ${entry.kind.name.lowercase()} on ${entry.savePath} was interrupted and the " +
+                        "game has since saved over it. Both copies were kept. Check the PC and the " +
+                        "save."
+                ),
+            )
+        }
+
+        val message = when (entry.kind) {
+            TransferKind.DEPOSIT ->
+                if (landed) {
+                    "A deposit completed: ${entry.savePath} no longer holds it and the PC does."
+                } else {
+                    storage.withdraw(entry.uid)
+                    "A deposit was rolled back: the save never changed, so the PC copy was removed."
+                }
+
+            TransferKind.WITHDRAW ->
+                if (landed) {
+                    storage.withdraw(entry.uid)
+                    "A withdrawal completed: the save holds it and the PC copy was removed."
+                } else {
+                    "A withdrawal was rolled back: the save never changed, so the PC kept it."
+                }
+        }
+        journal.clear()
+        return RecoveryReport(listOf(message), emptyList())
+    }
+
+    /** Drops the journal without touching either copy, once a player has looked. */
+    fun dismissUnresolved() = journal.clear()
+
+    fun pendingTransfer(): TransferEntry? = journal.read()
+
+    // ------------------------------------------------------------------
+
+    private suspend fun reload(loaded: LoadedSave): LoadedSave? =
+        (saves.load(loaded.remote) as? SyncResult.Ok)?.value
+
+    private fun journalEntry(
+        kind: TransferKind,
+        uid: String,
+        monFingerprint: String,
+        loaded: LoadedSave,
+        before: String,
+        after: String,
+        location: SaveLocation,
+    ) = TransferEntry(
+        id = UUID.randomUUID().toString(),
+        kind = kind,
+        stage = TransferStage.PREPARED,
+        uid = uid,
+        monFingerprint = monFingerprint,
+        saveId = loaded.key,
+        savePath = "${loaded.remote.version.label} ${loaded.remote.label}",
+        saveDirectoryKey = loaded.remote.playthroughId,
+        mainName = loaded.remote.slot ?: loaded.remote.playthroughId,
+        saveHashBefore = before,
+        saveHashAfter = after,
+        sourceKind = when (location) {
+            is SaveLocation.Party -> Provenance.KIND_PARTY
+            is SaveLocation.Box -> Provenance.KIND_BOX
+        },
+        sourceIndex = when (location) {
+            is SaveLocation.Party -> location.slot
+            is SaveLocation.Box -> location.slot
+        },
+        boxIndex = (location as? SaveLocation.Box)?.box ?: 0,
+        startedAtEpochMillis = now(),
+        baseRev = loaded.rev,
+    )
+
+    private fun provenanceOf(loaded: LoadedSave, save: Gen1RecompSave, entry: TransferEntry) =
+        Provenance(
+            gameVersion = loaded.remote.version.id,
+            saveId = loaded.key,
+            savePath = entry.savePath,
+            slotId = loaded.remote.slot,
+            trainerName = save.trainerName,
+            trainerId = save.trainerId,
+            playthroughId = loaded.remote.playthroughId,
+            sourceKind = entry.sourceKind,
+            sourceIndex = entry.sourceIndex,
+            depositedAtEpochMillis = now(),
+        )
+
+    /**
+     * Whether [save] already holds a Pokémon identical to this one.
+     *
+     * Content, not identity: two Pokémon that fingerprint the same are the same
+     * Pokémon as far as anything can tell, including the cartridge. A genuine
+     * coincidence — two untouched Pokémon of the same species, level, DVs,
+     * moves, PP and OT — would be refused as well, which costs a player one
+     * deposit of an interchangeable Pokémon and is the safe side to err on.
+     */
+    private fun alreadyHolds(save: Gen1RecompSave, fingerprint: String): Boolean =
+        save.party.any { it.fingerprint == fingerprint } ||
+            save.boxes.any { box -> box.any { it.fingerprint == fingerprint } }
+
+    /** What the app believes it has put where, for the save files screen. */
+    fun placements(): List<Placement> = ledger.all()
+
+    /** Drops one record, for a player who knows the cartridge no longer holds it. */
+    fun forgetPlacement(fingerprint: String) = ledger.forget(fingerprint)
+
+    /** The no-duplication invariant, checked rather than assumed. */
+    private fun holdsExactlyOne(uid: String): Boolean =
+        storage.state().boxes.sumOf { box -> box.contents.count { it.uid == uid } } == 1
+
+    private fun pokemonAt(save: Gen1RecompSave, location: SaveLocation): Gen1Pokemon? = when (location) {
+        is SaveLocation.Party -> save.party.getOrNull(location.slot - 1)
+        is SaveLocation.Box -> save.boxes.getOrNull(location.box - 1)?.getOrNull(location.slot - 1)
+    }
+
+    /**
+     * Upstream `BoxMenu.deposit` refuses to store the last party Pokémon
+     * ("You can't deposit the last POKéMON!"). A save with an empty party is
+     * not a state the game can be handed back, so the rule holds here too.
+     */
+    private fun constraintForDeposit(save: Gen1RecompSave, location: SaveLocation): String? {
+        // The cartridge's own rule, and not a nicety: a letter lives in a
+        // slot of the save rather than on the Pokemon, so one that leaves
+        // the cartridge cannot take it. "There is a #MON holding MAIL.
+        // Please remove the MAIL." — `_PCMonHoldingMailText`, refused by
+        // `BillsPC_CheckMail_PreventBlackout` before the PC will store
+        // anything. See [Gen2Mail].
+        pokemonAt(save, location)?.let {
+            if (it.holdsMail) return "THAT POKéMON IS HOLDING MAIL. REMOVE THE MAIL FIRST."
+        }
+        return when (location) {
+            is SaveLocation.Party ->
+                if (save.partyCount <= 1) "YOU CAN'T DEPOSIT THE LAST POKéMON!" else null
+            is SaveLocation.Box -> null
+        }
+    }
+
+    private fun constraintForWithdraw(save: Gen1RecompSave, target: WithdrawTarget): String? =
+        when (target) {
+            WithdrawTarget.Party ->
+                if (save.partyCount >= Gen1RecompSave.PARTY_MAX) {
+                    "YOU CAN'T TAKE ANY MORE POKéMON. DEPOSIT POKéMON FIRST."
+                } else null
+            is WithdrawTarget.Box ->
+                if (save.boxFreeSlots(target.box) <= 0) "BOX ${target.box} IS FULL." else null
+        }
+}
+
+/**
+ * Why [stored] cannot be written into a save of [saveGeneration], or null
+ * when it can go.
+ *
+ * The rule itself is [TransferEngine.withdraw]'s and is enforced there, at
+ * the point of writing, where it has to be. This is the same question asked
+ * early so the app can decline to ask rather than sending a Pokemon out over
+ * the cable, drawing the whole trade, and only then saying it never had
+ * anywhere to go. Pure, and needs nothing loaded: a generation is all either
+ * side of the question turns on.
+ */
+fun crossGenerationRefusal(stored: StoredPokemon, saveGeneration: Int): String? {
+    if (stored.generation == saveGeneration) return null
+    val name = stored.pokemon.displayName.uppercase()
+    return if (stored.generation < saveGeneration) {
+        "$name IS A GEN I POKéMON. SEND IT THROUGH THE TIME CAPSULE FIRST."
+    } else {
+        "$name CAME FROM GEN II AND CANNOT GO BACK."
+    }
+}

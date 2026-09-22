@@ -1,0 +1,181 @@
+package com.logie.gen1storage.download
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.logie.gen1storage.R
+
+/**
+ * Keeps a download alive while the player is somewhere else.
+ *
+ * Android freezes and then kills a process the moment it stops being the app
+ * on screen, and a coroutine belonging to a view model goes with it — which
+ * is why a sprite download used to stop dead as soon as the app was put
+ * away. A foreground service is the one way to tell the system that work is
+ * genuinely in progress, and the price of saying so is a notification the
+ * player can see, which is fair: it is their battery and their data.
+ *
+ * The service does no downloading itself. The work runs in a scope that
+ * outlives the screen; this only holds the process open and says how far
+ * along it is.
+ */
+class DownloadService : Service() {
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        running = false
+        super.onDestroy()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val percent = intent?.getIntExtra(EXTRA_PERCENT, 0) ?: 0
+        val label = intent?.getStringExtra(EXTRA_LABEL) ?: "DOWNLOADING"
+
+        // Going foreground is allowed to fail, and it does: the system
+        // refuses a foreground service started while the app is not on
+        // screen, and a long download is exactly the thing a player walks
+        // away from. Refused, the right answer is to stand down — the
+        // download itself carries on in its own scope for as long as the
+        // process lives. Throwing here would take the whole app with it,
+        // which is what was happening partway through DOWNLOAD ALL.
+        running = true
+        val started = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification(label, percent),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification(label, percent))
+            }
+        }.isSuccess
+        if (!started) {
+            running = false
+            // The system said no to this one; it will say no to the next four
+            // hundred as well, and each of those is a clock it can crash the
+            // app over. The download carries on regardless — it is the
+            // notification that is lost, not the files.
+            refused = true
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        // Not sticky: a process that died mid-download should not have the
+        // system restart a service with nothing left running behind it.
+        return START_NOT_STICKY
+    }
+
+    private fun notification(label: String, percent: Int): Notification =
+        build(this, label, percent)
+
+    companion object {
+        private const val CHANNEL_ID = "downloads"
+        private const val NOTIFICATION_ID = 1
+        private const val EXTRA_PERCENT = "percent"
+        private const val EXTRA_LABEL = "label"
+
+        /**
+         * Starts the service, or updates what it is saying. Best effort: a
+         * device that refuses the service is a device the download runs on
+         * anyway, for as long as it is allowed to.
+         */
+        fun show(context: Context, label: String, percent: Int) {
+            // Already up: the bar moves by rewriting the notification, not by
+            // starting the service again.
+            //
+            // A download is hundreds of files and every one of them reports.
+            // Each report used to be another `startForegroundService`, so a
+            // run posted several hundred start intents in a burst — and a
+            // start intent the service does not answer with `startForeground`
+            // in time is a crash the system raises against the app, which is
+            // what was taking it down whenever a download actually had
+            // something to fetch.
+            if (running) {
+                runCatching {
+                    context.getSystemService(NotificationManager::class.java)
+                        ?.notify(NOTIFICATION_ID, build(context, label, percent))
+                }
+                return
+            }
+            // Asked once and refused, asked no more.
+            //
+            // A start the system will not allow — which is every start made
+            // while the app is not on screen, and a long download is exactly
+            // what a player walks away from — leaves `running` false, so the
+            // next report tried again, and the one after that. A stage is a
+            // hundred reports and a run is four stages: four hundred start
+            // intents, each of them a five second clock the system will crash
+            // the app over if the service does not answer in time. One
+            // refusal now stands for the rest of the run, and the bar carries
+            // on as a plain notification instead.
+            if (refused) {
+                runCatching {
+                    context.getSystemService(NotificationManager::class.java)
+                        ?.notify(NOTIFICATION_ID, build(context, label, percent))
+                }
+                return
+            }
+            val intent = Intent(context, DownloadService::class.java)
+                .putExtra(EXTRA_LABEL, label)
+                .putExtra(EXTRA_PERCENT, percent)
+            val asked = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }
+            if (asked.isFailure) refused = true
+        }
+
+        fun hide(context: Context) {
+            running = false
+            refused = false
+            runCatching { context.stopService(Intent(context, DownloadService::class.java)) }
+        }
+
+        /** Whether the service is up, so an update is an update rather than a start. */
+        @Volatile
+        private var running = false
+
+        /**
+         * Whether the system has already turned a start down this run.
+         *
+         * Cleared by [hide], which is the end of a download — the next one is
+         * a fresh question, and by then the app may well be on screen again.
+         */
+        @Volatile
+        private var refused = false
+
+        /** The notification itself, buildable without a service instance. */
+        fun build(context: Context, label: String, percent: Int): Notification {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                manager?.createNotificationChannel(
+                    NotificationChannel(
+                        CHANNEL_ID,
+                        "Downloads",
+                        // Low: it is a progress bar, not news.
+                        NotificationManager.IMPORTANCE_LOW,
+                    )
+                )
+            }
+            return NotificationCompat.Builder(context, CHANNEL_ID)
+                .setContentTitle(context.getString(R.string.app_name))
+                .setContentText(label)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setProgress(100, percent, false)
+                .setOngoing(true)
+                .setSilent(true)
+                .build()
+        }
+    }
+}
