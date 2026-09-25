@@ -1,3 +1,4 @@
+import useBackend from '@openhome-core/backend/useBackend'
 import { PathData } from '@openhome-core/save/util/path'
 import { R } from '@openhome-core/util/functional'
 import { Dialog } from '@openhome-ui/components/dialog/Dialog'
@@ -19,10 +20,19 @@ import { SaveViewMode } from './util'
 export interface SavesModalProps {
   open?: boolean
   onClose: () => void
+  /** The tab to show when the dialog opens; phones default to Gen1Recomp Save Sync. */
+  initialTab?: string
+}
+
+function isMobilePlatform(platform: string): boolean {
+  return platform === 'android' || platform === 'ios'
 }
 
 const SavesModal = (props: SavesModalProps) => {
   const { open, onClose } = props
+  const backend = useBackend()
+  const isMobile = isMobilePlatform(backend.getPlatform())
+  const initialTab = props.initialTab ?? (isMobile ? 'gen1recomp' : 'recents')
   const [{ settings }, dispatchAppInfoState] = useContext(AppInfoContext)
   const { buildAndOpenSave } = useSaves()
   const displayError = useDisplayError()
@@ -57,21 +67,21 @@ const SavesModal = (props: SavesModalProps) => {
       onOpenChange={(open) => !open && onClose?.()}
       style={{
         width: '95vw',
-        minWidth: 800,
+        minWidth: isMobile ? undefined : 800,
         height: 'calc(90vh - 32px)',
         overflow: 'hidden',
         padding: 0,
       }}
     >
-      <SideTabs.Root defaultValue="recents">
+      <SideTabs.Root defaultValue={initialTab}>
         <SideTabs.TabList>
           <Button onClick={() => openSaveAndCloseModal()} size="1" style={{ width: '100%' }}>
             Open File
           </Button>
+          <SideTabs.Tab value="gen1recomp">Gen1Recomp Sync</SideTabs.Tab>
           <SideTabs.Tab value="recents">Recents</SideTabs.Tab>
           <SideTabs.Tab value="suggested">Suggested</SideTabs.Tab>
           <SideTabs.Tab value="folders">Save Folders</SideTabs.Tab>
-          <SideTabs.Tab value="gen1recomp">Gen1Recomp Sync</SideTabs.Tab>
           <div style={{ flex: 1 }} />
           {viewMode === 'card' && (
             <label style={{ margin: 4, color: 'white' }}>

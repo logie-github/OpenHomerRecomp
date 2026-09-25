@@ -15,7 +15,7 @@ import SavesModal from '@openhome-ui/saves/SavesModal'
 import { useSaves } from '@openhome-ui/state/saves'
 import { Button, Card, Flex, Tabs } from '@radix-ui/themes'
 import { useCallback, useEffect, useState } from 'react'
-import { MdFileOpen } from 'react-icons/md'
+import { MdFileOpen, MdSync } from 'react-icons/md'
 import DisplayPanel from './display/DisplayPanel'
 import './Home.css'
 import ReleaseArea from './ReleaseArea'
@@ -24,6 +24,7 @@ const Home = () => {
   const backend = useBackend()
   const [selectedMon, setSelectedMon] = useState<PKMInterface>()
   const [openSaveDialog, setOpenSaveDialog] = useState(false)
+  const [saveDialogTab, setSaveDialogTab] = useState<string>()
   const savesAndBanks = useSaves()
   const displayError = useDisplayError()
 
@@ -71,9 +72,24 @@ const Home = () => {
         {range(savesAndBanks.allOpenSaves.length).map((i) => (
           <OpenSaveDisplay key={`save_display_${i}`} saveIndex={i} />
         ))}
-        <Button onClick={() => setOpenSaveDialog(true)}>
+        <Button
+          onClick={() => {
+            setSaveDialogTab(undefined)
+            setOpenSaveDialog(true)
+          }}
+        >
           <MdFileOpen />
           Open Save
+        </Button>
+        <Button
+          variant="soft"
+          onClick={() => {
+            setSaveDialogTab('gen1recomp')
+            setOpenSaveDialog(true)
+          }}
+        >
+          <MdSync />
+          Gen1Recomp Sync
         </Button>
       </Flex>
       <div className="home-box-column">
@@ -115,7 +131,11 @@ const Home = () => {
         mon={selectedMon}
         onClose={() => setSelectedMon(undefined)}
       />
-      <SavesModal open={openSaveDialog} onClose={() => setOpenSaveDialog(false)} />
+      <SavesModal
+        open={openSaveDialog}
+        initialTab={saveDialogTab}
+        onClose={() => setOpenSaveDialog(false)}
+      />
     </Flex>
   )
 }
