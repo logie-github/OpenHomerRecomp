@@ -9,6 +9,7 @@ import {
   PaginatedPage,
   PaginationCursor,
   PluginMetadata,
+  RemoteSave,
 } from '@openhome-core/tauri/spectaCommands'
 import { Errorable, Option, Result } from '@openhome-core/util/functional'
 import { LoadSaveResponse, LookupMap, SaveRef } from '@openhome-core/util/types'
@@ -153,6 +154,13 @@ export default interface BackendInterface {
   downloadPlugin(remoteUrl: string): Promise<Errorable<string>>
   loadPluginCode(pluginId: string): Promise<Errorable<string>>
   deletePlugin(pluginId: string): Promise<Errorable<null>>
+
+  /* gen1recomp save sync */
+  /* the label this device is linked under, or null when not linked */
+  gen1RecompSyncStatus(): Promise<Errorable<string | null>>
+  gen1RecompSyncLink(code1: string, code2: string): Promise<Errorable<null>>
+  gen1RecompSyncUnlink(): Promise<Errorable<null>>
+  gen1RecompSyncListSaves(): Promise<Errorable<RemoteSave[]>>
 }
 
 export type BankOrBoxChange = { bank: number; box: number }

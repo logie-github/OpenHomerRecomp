@@ -9,6 +9,7 @@ import BackendInterface, {
 } from '@openhome-core/backend/backendInterface'
 import { OhpkmIdentifier } from '@openhome-core/pkm/Lookup'
 import { OHPKM } from '@openhome-core/pkm/OHPKM'
+import { parseGen1RecompSyncPath } from '@openhome-core/save/gen1recomp/Gen1RecompSAV'
 import { SAV, SaveWriter } from '@openhome-core/save/interfaces'
 import { PathData, PossibleSaves } from '@openhome-core/save/util/path'
 import { SaveFolder, SimpleOpenHomeBox, StoredBankData } from '@openhome-core/save/util/storage'
@@ -65,6 +66,20 @@ function filterUndefinedValues(obj: Partial<Record<string, string>>) {
 }
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000'
+
+// A save opened through Gen1Recomp Save Sync is uploaded to the sync account
+// rather than written to disk.
+function writeSaveBytes(filePath: string, bytes: Uint8Array): Promise<Errorable<null>> {
+  const syncSave = parseGen1RecompSyncPath(filePath)
+  if (syncSave) {
+    return Commands.gen1recompSyncWriteSave(
+      syncSave.version,
+      syncSave.playthroughId,
+      new TextDecoder().decode(bytes)
+    )
+  }
+  return Commands.writeFileBytes(filePath, Array.from(bytes))
+}
 
 type OnDropEvent = Event<{ position: { x: number; y: number }; paths: string[] }>
 
@@ -170,6 +185,12 @@ export const TauriBackend: BackendInterface = {
 
   /* game saves */
   loadSaveFile: async (pathData: PathData): Promise<Errorable<LoadSaveResponse>> => {
+    const syncSave = parseGen1RecompSyncPath(pathData.raw)
+    if (syncSave) {
+      return Commands.gen1recompSyncLoadSave(syncSave.version, syncSave.playthroughId).then(
+        R.map((blob) => ({ path: pathData, fileBytes: new TextEncoder().encode(blob) }))
+      )
+    }
     const bytesResult = await Commands.get_file_bytes(pathData.raw)
     if (R.isErr(bytesResult)) {
       return bytesResult
@@ -184,13 +205,10 @@ export const TauriBackend: BackendInterface = {
       createdDate: timestampResult.data ? new Date(timestampResult.data) : undefined,
     })
   },
-  writeSaveFile: async (path: string, bytes: Uint8Array) =>
-    Commands.writeFileBytes(path, Array.from(bytes)),
+  writeSaveFile: async (path: string, bytes: Uint8Array) => writeSaveBytes(path, bytes),
   writeAllSaveFiles: async (saveWriters: SaveWriter[]) =>
     Promise.all(
-      saveWriters.map((saveWriter) =>
-        Commands.writeFileBytes(saveWriter.filepath, Array.from(saveWriter.bytes))
-      )
+      saveWriters.map((saveWriter) => writeSaveBytes(saveWriter.filepath, saveWriter.bytes))
     ),
   saveLocalFile: async (bytes: Uint8Array, suggestedName: string) => {
     const defaultPath = await path.join(await path.downloadDir(), suggestedName)
@@ -341,6 +359,12 @@ export const TauriBackend: BackendInterface = {
   downloadPlugin: Commands.downloadPlugin,
   loadPluginCode: Commands.loadPluginCode,
   deletePlugin: Commands.deletePlugin,
+
+  /* gen1recomp save sync */
+  gen1RecompSyncStatus: Commands.gen1recompSyncStatus,
+  gen1RecompSyncLink: Commands.gen1recompSyncLink,
+  gen1RecompSyncUnlink: Commands.gen1recompSyncUnlink,
+  gen1RecompSyncListSaves: Commands.gen1recompSyncListSaves,
   getLogs: (filter: LogFilter) => {
     const { start, end, ...otherParams } = filter
     const ipcFilter: LogFilterJs = {

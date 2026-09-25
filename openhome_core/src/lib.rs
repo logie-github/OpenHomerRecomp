@@ -1,6 +1,7 @@
 pub mod convert_strategies;
 pub mod data_controller;
 pub mod error;
+pub mod gen1recomp_sync;
 pub mod lookup;
 pub mod ohpkm_store;
 pub mod pkm_storage;

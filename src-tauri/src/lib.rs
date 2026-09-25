@@ -1,6 +1,7 @@
 mod commands;
 mod data_controller;
 mod deprecated;
+mod gen1recomp_sync;
 mod logging;
 mod menu;
 mod plugin;
@@ -67,6 +68,12 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         synced_state::ohpkm_store::permanently_delete_ohpkms,
         logging::get_logs_today,
         logging::clear_logs_for_range,
+        gen1recomp_sync::gen1recomp_sync_status,
+        gen1recomp_sync::gen1recomp_sync_link,
+        gen1recomp_sync::gen1recomp_sync_unlink,
+        gen1recomp_sync::gen1recomp_sync_list_saves,
+        gen1recomp_sync::gen1recomp_sync_load_save,
+        gen1recomp_sync::gen1recomp_sync_write_save,
     ])
 }
 
@@ -158,6 +165,7 @@ pub fn run() {
                 }
             };
             app.manage(pokedex_state);
+            app.manage(gen1recomp_sync::Gen1RecompSyncState::default());
 
             app.manage(state::AppState::from_update_features(update_features));
 

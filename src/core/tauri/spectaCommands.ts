@@ -327,6 +327,82 @@ export const commands = {
       else return { status: 'error', error: e as any }
     }
   },
+  /**
+   * The label this device is linked under, or null when it is not linked.
+   */
+  async gen1recompSyncStatus(): Promise<Result<string | null, CommandError>> {
+    try {
+      return { status: 'ok', data: await TAURI_INVOKE('gen1recomp_sync_status') }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
+  /**
+   * Links OpenHome to the sync account using the two codes from Gen1Recomp's
+   * SAVE SYNC screen.
+   */
+  async gen1recompSyncLink(code1: string, code2: string): Promise<Result<null, CommandError>> {
+    try {
+      return { status: 'ok', data: await TAURI_INVOKE('gen1recomp_sync_link', { code1, code2 }) }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
+  async gen1recompSyncUnlink(): Promise<Result<null, CommandError>> {
+    try {
+      return { status: 'ok', data: await TAURI_INVOKE('gen1recomp_sync_unlink') }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
+  async gen1recompSyncListSaves(): Promise<Result<RemoteSave[], CommandError>> {
+    try {
+      return { status: 'ok', data: await TAURI_INVOKE('gen1recomp_sync_list_saves') }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
+  /**
+   * Downloads a playthrough's save (its Lua source) and remembers the revision
+   * it was read at, which the next write is checked against.
+   */
+  async gen1recompSyncLoadSave(
+    version: string,
+    playthroughId: string
+  ): Promise<Result<string, CommandError>> {
+    try {
+      return {
+        status: 'ok',
+        data: await TAURI_INVOKE('gen1recomp_sync_load_save', { version, playthroughId }),
+      }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
+  /**
+   * Uploads a changed save over the revision it was read at. Refused (and
+   * nothing written) if Gen1Recomp has uploaded that playthrough since.
+   */
+  async gen1recompSyncWriteSave(
+    version: string,
+    playthroughId: string,
+    blob: string
+  ): Promise<Result<null, CommandError>> {
+    try {
+      return {
+        status: 'ok',
+        data: await TAURI_INVOKE('gen1recomp_sync_write_save', { version, playthroughId, blob }),
+      }
+    } catch (e) {
+      if (e instanceof Error) throw e
+      else return { status: 'error', error: e as any }
+    }
+  },
 }
 
 /** user-defined events **/
@@ -449,6 +525,25 @@ export type PokedexEntry = { formes: Partial<{ [key in number]: PokedexStatus }>
 export type PokedexStatus = 'Seen' | 'Caught' | 'ShinyCaught'
 export type PokedexUpdate = { nationalDex: number; formIndex: number; status: PokedexStatus }
 export type PossibleSaves = { citra: PathData[]; desmume: PathData[]; open_emu: PathData[] }
+/**
+ * What the server lists for one playthrough.
+ */
+export type RemoteSave = {
+  /**
+   * `<version>/<playthroughId>`, the server's key.
+   */
+  key: string
+  version: string
+  playthroughId: string
+  rev: number
+  trainerName: string | null
+  badges: number | null
+  timeText: string | null
+  /**
+   * Whether OpenHome can open this playthrough (Generation I only).
+   */
+  supported: boolean
+}
 export type SaveRef = {
   filePath: PathData
   game: number

@@ -10,6 +10,7 @@ import { useCallback, useContext, useState } from 'react'
 import 'react-data-grid/lib/styles.css'
 import useDebounce from '../hooks/debounce'
 import useDisplayError from '../hooks/displayError'
+import Gen1RecompSync from './Gen1RecompSync'
 import RecentSaves from './RecentSaves'
 import SaveFolders from './SaveFolders'
 import SuggestedSaves from './SuggestedSaves'
@@ -70,6 +71,7 @@ const SavesModal = (props: SavesModalProps) => {
           <SideTabs.Tab value="recents">Recents</SideTabs.Tab>
           <SideTabs.Tab value="suggested">Suggested</SideTabs.Tab>
           <SideTabs.Tab value="folders">Save Folders</SideTabs.Tab>
+          <SideTabs.Tab value="gen1recomp">Gen1Recomp Sync</SideTabs.Tab>
           <div style={{ flex: 1 }} />
           {viewMode === 'card' && (
             <label style={{ margin: 4, color: 'white' }}>
@@ -134,6 +136,9 @@ const SavesModal = (props: SavesModalProps) => {
         </SideTabs.Panel>
         <SideTabs.Panel value="folders">
           <SaveFolders />
+        </SideTabs.Panel>
+        <SideTabs.Panel value="gen1recomp">
+          <Gen1RecompSync onOpen={openSaveAndCloseModal} />
         </SideTabs.Panel>
       </SideTabs.Root>
     </Dialog.Container>

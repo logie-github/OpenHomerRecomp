@@ -3,6 +3,7 @@ import { PKMInterface } from '@openhome-core/pkm/interfaces'
 import { OhpkmIdentifier } from '@openhome-core/pkm/Lookup'
 import { OHPKM } from '@openhome-core/pkm/OHPKM'
 import { displayIndexAdder, isBattleFormeItem } from '@openhome-core/pkm/util'
+import { parseGen1RecompSyncPath } from '@openhome-core/save/gen1recomp/Gen1RecompSAV'
 import { getSaveRef, SAV, SaveIdentifier } from '@openhome-core/save/interfaces'
 import { SAVClass } from '@openhome-core/save/util'
 import { buildSaveFile, getPossibleSaveTypes } from '@openhome-core/save/util/load'
@@ -365,7 +366,10 @@ export function useSaves(): SavesAndBanksManager {
   const addSave = useCallback(
     async (save: SAV): Promise<Result<SAV, SaveError>> => {
       try {
-        await backend.addRecentSave(getSaveRef(save))
+        // a Save Sync playthrough has no file to reopen from the recents list
+        if (!parseGen1RecompSyncPath(save.filePath.raw)) {
+          await backend.addRecentSave(getSaveRef(save))
+        }
         const result = await backend.registerInPokedex(pokedexSeenFromSave(save))
         if (R.isErr(result)) {
           console.error('Error registering pokedex entries from save:', result.error)
