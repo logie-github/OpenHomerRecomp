@@ -1,0 +1,99 @@
+name: Build Android APK
+
+# Builds an arm64 APK and attaches it to a GitHub prerelease, so it can be
+# downloaded straight onto a phone.
+#
+# Signing: if the ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD secrets are
+# set, every build is signed with that key and installs over the previous one.
+# Without them a throwaway key is generated per run, so a new build has to be
+# installed after uninstalling the old one (which erases the app's data).
+
+on:
+  push:
+    branches: [claude/gen1recomp-save-sync-android-wc0tr1]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-linux-android
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Use the runner's Android NDK
+        run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Install Frontend Dependencies
+        run: pnpm i --frozen-lockfile
+
+      - name: Generate the Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build APK
+        run: pnpm tauri android build --apk --target aarch64 --ci
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          UNSIGNED=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+            PASS="$KEYSTORE_PASSWORD"
+          else
+            PASS=sideload
+            keytool -genkeypair -keystore release.jks -alias openhome -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=OpenHome Sideload"
+          fi
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "$BUILD_TOOLS/apksigner" sign --ks release.jks --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
+            --out OpenHome-arm64.apk aligned.apk
+          "$BUILD_TOOLS/apksigner" verify OpenHome-arm64.apk
+          rm release.jks
+
+      - name: Publish to a prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          name: OpenHome Android build ${{ github.run_number }}
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: |
+            OpenHome with Gen1Recomp Save Sync, for 64-bit Android phones.
+            Download **OpenHome-arm64.apk** below on your phone and open it to install.
+          files: OpenHome-arm64.apk
