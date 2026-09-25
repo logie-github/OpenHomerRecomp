@@ -44,17 +44,24 @@ pub fn get_data_dir_path(
 
 #[tauri::command]
 #[specta::specta]
+#[cfg_attr(mobile, allow(unreachable_code, unused_variables))]
 pub async fn change_data_dir(
     app_handle: tauri::AppHandle,
     startup_config_state: tauri::State<'_, StartupConfigState>,
     should_move: bool, // if true, files in current dir are moved to the new one and deleted from the current one
 ) -> CommandResult<()> {
-    let Some(selected_dir) = app_handle
+    #[cfg(mobile)]
+    let selected_dir: Option<tauri_plugin_dialog::FilePath> = {
+        let _ = (&startup_config_state, should_move);
+        return Err(Error::other("Changing the data folder is not supported on mobile").into());
+    };
+    #[cfg(desktop)]
+    let selected_dir = app_handle
         .dialog()
         .file()
         .set_title("Select a directory where OpenHome data should be stored")
-        .blocking_pick_folder()
-    else {
+        .blocking_pick_folder();
+    let Some(selected_dir) = selected_dir else {
         return Ok(());
     };
 

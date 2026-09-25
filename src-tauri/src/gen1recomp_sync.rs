@@ -16,7 +16,16 @@ pub struct Gen1RecompSyncState(Mutex<OpenSyncSaves>);
 const DEVICE_LABEL: &str = "OpenHome";
 
 async fn send(request: HttpRequest) -> Result<HttpResponse, String> {
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder();
+    // reqwest's default verifier needs JNI setup on Android; Mozilla's root
+    // store is enough for the sync server.
+    #[cfg(target_os = "android")]
+    let builder = builder.tls_certs_only(
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|cert| reqwest::Certificate::from_der(cert).ok()),
+    );
+    let client = builder
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(sync::TIMEOUT_SECONDS))
         .build()

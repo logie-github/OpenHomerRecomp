@@ -1,7 +1,9 @@
 use crate::data_controller::ToDataController;
+#[cfg(desktop)]
+use crate::menu;
 use crate::plugin;
 use crate::state::{AppState, AppStateInner};
-use crate::{menu, util};
+use crate::util;
 use openhome_core::data_controller::{DataController, DataDir};
 use openhome_core::error::{Error, Result};
 use openhome_core::pkm_storage::StoredBankDataWasm;
@@ -184,7 +186,10 @@ pub fn delete_plugin(app_handle: tauri::AppHandle, plugin_id: String) -> Command
 #[tauri::command]
 #[specta::specta]
 pub fn handle_windows_accelerator(app_handle: tauri::AppHandle, menu_event_id: String) {
+    #[cfg(desktop)]
     menu::handle_menu_event_id(&app_handle, menu_event_id.as_ref());
+    #[cfg(mobile)]
+    let _ = (app_handle, menu_event_id);
 }
 
 #[tauri::command]

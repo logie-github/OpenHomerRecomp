@@ -123,23 +123,32 @@ Pokémon moves between generations.
 ## 6. Android requirements
 
 The sync feature is platform-neutral: HTTPS through reqwest, credentials in OpenHome's storage
-folder, and no desktop APIs. OpenHome's Tauri shell does not build for Android yet, though. That
-porting work is separate from this feature:
+folder, and no desktop APIs. OpenHome's Tauri shell needed these changes to build for Android:
 
-- `src-tauri/gen/android` does not exist yet; run `tauri android init`.
-- `menu.rs` has a `cfg_select!` that `panic!`s at compile time on non-desktop targets. The menu and
-  `show_error_dialog` need desktop-only `cfg`s.
-- `tauri_plugin_window_state` is registered unconditionally, but the dependency is desktop-only in
-  `Cargo.toml`.
+- The menu (`menu.rs`), the window-state plugin and the data-folder picker are desktop-only
+  (`#[cfg(desktop)]`).
+- `tauri.android.conf.json` gives Android the reverse-domain identifier it requires
+  (`dev.andrewbenington.openhome`); the desktop identifier is unchanged.
+- On mobile, `XDG_CONFIG_HOME`/`XDG_DATA_HOME` point at the app's own folders before startup,
+  because the `dirs` crate otherwise resolves outside the Android sandbox.
+
+Building an APK (arm64):
+
+```sh
+export ANDROID_HOME=<sdk> NDK_HOME=<sdk>/ndk/<version>
+pnpm tauri android init          # src-tauri/gen is gitignored, so generate it once
+pnpm tauri android build --apk --target aarch64
+# then zipalign + apksigner the unsigned APK in src-tauri/gen/android/app/build/outputs/apk
+```
 
 Requirements specific to Save Sync:
 
 - **Network:** the `INTERNET` permission, which Tauri's Android template already includes. The
   server is HTTPS, so no cleartext-traffic config is needed.
-- **TLS:** reqwest 0.13 uses `rustls-platform-verifier`. On Android it must be initialized with the
-  app's JNI context (`rustls_platform_verifier::android::init_hosted`), and its Android component
-  must be added to the Gradle project. Otherwise every HTTPS call fails. The existing plugin
-  downloader has the same requirement.
+- **TLS:** reqwest 0.13's default verifier (`rustls-platform-verifier`) needs JNI setup on Android.
+  The sync client instead trusts Mozilla's root store (`webpki-root-certs`) on Android. The
+  existing plugin downloader still uses the default client, so plugin downloads may fail on
+  Android.
 - **Lifecycle and background sync:** none needed. OpenHome only contacts the server when the user
   opens or saves a playthrough, and `baseRev` rejects stale writes. Gen1Recomp's own sync (after
   saves, every 5 minutes, on resume) picks up OpenHome's writes.
@@ -168,7 +177,7 @@ conflict rule, which is out of scope here.
 4. `gen1Constants.ts` and `gen1RecompMon.ts`: the Lua ↔ PK1 adapter.
 5. `Gen1RecompSAV`: PC boxes as PK1, verbatim write-back, locked slots for unknown records.
 6. Backend routing of `gen1recomp-sync://` paths, save-type registration, and the UI tab.
-7. Android shell bring-up (§6). Not done here.
+7. Android shell bring-up (§6).
 
 ## Scope limits
 

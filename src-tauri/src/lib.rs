@@ -3,6 +3,7 @@ mod data_controller;
 mod deprecated;
 mod gen1recomp_sync;
 mod logging;
+#[cfg(desktop)]
 mod menu;
 mod plugin;
 mod startup;
@@ -83,11 +84,34 @@ pub fn run() {
 
     let specta_handler = specta_builder.invoke_handler();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_window_state::Builder::new().build())
+        .on_menu_event(|app_handle, event| {
+            menu::handle_menu_event(app_handle, event);
+        });
+
+    builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            // OpenHome finds its config and default data folders with the
+            // `dirs` crate, which on Android resolves outside the app's
+            // sandbox. Point it at the app's own folders instead.
+            #[cfg(mobile)]
+            {
+                let paths = app.path();
+                if let (Ok(config), Ok(data)) = (paths.app_config_dir(), paths.app_data_dir()) {
+                    // SAFETY: runs once during setup, before any other code
+                    // of ours reads the environment.
+                    unsafe {
+                        env::set_var("XDG_CONFIG_HOME", config);
+                        env::set_var("XDG_DATA_HOME", data);
+                    }
+                }
+            }
+
             let startup_config_state = match startup_config::StartupConfigState::load_or_create() {
                 Ok(state) => state,
                 Err(err) => {
@@ -169,19 +193,17 @@ pub fn run() {
 
             app.manage(state::AppState::from_update_features(update_features));
 
+            #[cfg(desktop)]
             match menu::create_menu(app) {
                 Ok(menu) => {
                     let _ = app.set_menu(menu);
-                    Ok(())
                 }
                 Err(e) => {
                     eprintln!("Error creating menu: {}", e);
-                    Err(e)
+                    return Err(e);
                 }
             }
-        })
-        .on_menu_event(|app_handle, event| {
-            menu::handle_menu_event(app_handle, event);
+            Ok(())
         })
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
